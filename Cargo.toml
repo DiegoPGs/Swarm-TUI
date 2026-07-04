@@ -1,0 +1,35 @@
+[package]
+name = "overstory"                    # ← rename here if switchboard/sindicato wins
+version = "0.0.1"
+edition = "2021"
+description = "One terminal above Claude Code, Antigravity CLI, and Codex CLI: session tabs per tool, a home view for cross-agent dispatch."
+license = "MIT"
+repository = ""                       # set on first push
+rust-version = "1.75"
+
+# Versions below were verified live on crates.io on 2026-07-04 (see docs/NOTES.md).
+# They are COMMENTED OUT so the doc-only scaffold + std-only stubs compile with zero
+# fetches. First implementation session: uncomment as each module comes alive, and
+# bump to current at that time.
+[dependencies]
+# ratatui = "0.30.2"                  # TUI framework                    (ADR-0005)
+# crossterm = "0.29.0"                # terminal backend + input          (ADR-0005)
+# tokio = { version = "1.52.3", features = ["full"] }   # async runtime  (ADR-0005)
+# portable-pty = "0.9.0"              # PTY spawning for embedded CLIs    (ADR-0003)
+# tui-term = "0.3.4"                  # vt100 pane widget for ratatui     (ADR-0003)
+# vt100 = "0.16.2"                    # terminal state machine            (ADR-0003)
+# rusqlite = { version = "0.40.1", features = ["bundled"] }  # registry   (ADR-0002)
+# serde = { version = "1", features = ["derive"] }
+# serde_json = "1.0.150"              # claude stream-json / codex JSONL  (ADR-0001)
+# thiserror = "2.0.18"
+# tracing = "0.1.44"
+# tracing-subscriber = "0.3"
+# directories = "6.0.0"               # XDG paths for overstory's own state
+# clap = { version = "4.6.1", features = ["derive"] }
+
+[dev-dependencies]
+# insta = "1"                         # snapshot tests for event normalization
+
+[profile.release]
+lto = "thin"
+strip = true
