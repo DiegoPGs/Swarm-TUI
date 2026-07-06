@@ -1,4 +1,4 @@
-//! overstory — one terminal above Claude Code, Antigravity CLI, and Codex CLI.
+//! swarm-tui — one terminal above Claude Code, Antigravity CLI, and Codex CLI.
 //!
 //! This is a documentation-first scaffold: every module below exists to pin a
 //! boundary decided in `docs/adr/`, not to do work yet. Start with `CLAUDE.md`
@@ -16,5 +16,5 @@ fn main() {
     // hand off to `app::run()` (ADR-0005). Before ANY of that: run
     // ./scripts/verify-clis.sh on the real machine and fold results into
     // docs/integrations/*.md — the adapters encode unverified (⬜) facts.
-    println!("overstory scaffold — read CLAUDE.md to begin.");
+    println!("swarm-tui scaffold — read CLAUDE.md to begin.");
 }

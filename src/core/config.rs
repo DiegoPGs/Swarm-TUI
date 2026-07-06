@@ -1,6 +1,6 @@
-//! overstory's own configuration & state locations.
+//! swarm-tui's own configuration & state locations.
 //!
-//! Scope guard: this covers overstory's files ONLY (registry db, logs, its own
+//! Scope guard: this covers swarm-tui's files ONLY (registry db, logs, its own
 //! settings). The wrapped tools' config/auth files are **read-never,
 //! write-never** territory for the whole codebase (AGENTS.md boundary); not
 //! even path constants for them belong here — path knowledge lives in the
@@ -9,13 +9,13 @@
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub struct OverstoryConfig {
+pub struct SwarmTuiConfig {
     /// Session registry database (ADR-0002), e.g.
-    /// `$XDG_DATA_HOME/overstory/registry.db`.
+    /// `$XDG_DATA_HOME/swarm-tui/registry.db`.
     pub registry_db: PathBuf,
 }
 
-impl OverstoryConfig {
+impl SwarmTuiConfig {
     /// TODO(next session): resolve via the `directories` crate (Cargo.toml has
     /// the pinned version commented) + optional `OVERSTORY_DATA_DIR` override
     /// for tests.

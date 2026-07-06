@@ -1,6 +1,4 @@
-# overstory
-
-*Working name — see "Naming" below.*
+# swarm-tui
 
 One terminal application that sits above three AI coding CLIs already installed and
 authenticated on this machine — **Claude Code** (`claude`), **Antigravity CLI** (`agy`),
@@ -8,12 +6,12 @@ and **Codex CLI** (`codex`) — and turns them into one workspace:
 
 - **Per-service tabs.** Launch, resume, and switch between full interactive sessions of
   each underlying CLI without leaving the app. Each session runs the real tool in a real
-  PTY; overstory never reimplements or re-authenticates any of them.
+  PTY; swarm-tui never reimplements or re-authenticates any of them.
 - **A home view.** A cross-cutting surface for work that spans more than one agent:
   dispatch a task to any of the three, broadcast the same prompt to several and compare,
   see every live session (foreground and background) in one roster.
 - **A thin session registry.** The CLIs keep owning their own transcripts and
-  resume-by-ID mechanics; overstory only maps its tabs onto their native session IDs so
+  resume-by-ID mechanics; swarm-tui only maps its tabs onto their native session IDs so
   a task dispatched headlessly from the home view can later be opened as a full
   interactive tab, mid-conversation.
 
@@ -29,7 +27,7 @@ still needs confirmation on the target machine (`scripts/verify-clis.sh` does th
 ## The shape of it
 
 ```
-┌─ overstory (Rust · ratatui) ────────────────────────────────────────┐
+┌─ swarm-tui (Rust · ratatui) ────────────────────────────────────────┐
 │  [Home]  [claude · auth-refactor]  [codex · #1]  [agy · #1]   tabs  │
 │                                                                     │
 │  Home view ── task router ── thin session registry (SQLite)         │
@@ -49,14 +47,9 @@ subagent system (see ADR-0004), or being a general terminal multiplexer.
 
 ## Naming
 
-Three options, pick one and rename the crate:
-
-- **overstory** — the forest canopy layer that sits above independent trees; the tool is
-  a layer above three agents that keep living their own lives. *(Current working name.)*
-- **switchboard** — the operator that patches calls between independent parties; honest
-  about the core job (routing work), extensible past three CLIs.
-- **sindicato** — a union of autonomous peers acting together without a boss; wears the
-  peer-agent architecture (ADR-0004) on its sleeve, reads well in Spanish and English.
+**swarm-tui** — chosen by the owner 2026-07-05 (a swarm of coding agents under one
+terminal UI). The design-session working name was *overstory*; older commits and the
+git history use it. The rejected candidates were *switchboard* and *sindicato*.
 
 ## License
 

@@ -5,7 +5,7 @@
 //! the tool's output — the native TUI is the UX (ADR-0001, ADR-0003).
 //!
 //! Failure-mode note (ARCHITECTURE.md): if the underlying native session is
-//! already attached elsewhere (e.g. a real terminal outside overstory), do not
+//! already attached elsewhere (e.g. a real terminal outside swarm-tui), do not
 //! fight over the PTY — offer a fork instead (Claude `--fork-session`,
 //! Codex `fork`, agy `/fork`).
 

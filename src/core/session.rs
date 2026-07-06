@@ -1,6 +1,6 @@
 //! Session records: what the thin registry stores (ADR-0002).
 //!
-//! One row per session overstory knows about. The natives own their transcripts
+//! One row per session swarm-tui knows about. The natives own their transcripts
 //! and state; we store only the *mapping* needed to find, resume, and display
 //! them. Deleting a row never deletes native state (orphan-mark, don't destroy).
 
@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
-    /// overstory-local id (registry primary key).
+    /// swarm-tui-local id (registry primary key).
     pub id: u64,
     /// Stable adapter slug: "claude-code" | "antigravity" | "codex"
     /// (`adapters::AdapterKind::id()`). Kept as a string because that is what
@@ -18,7 +18,7 @@ pub struct SessionRecord {
     /// The tool's own session/conversation/thread id, once known. `None` for a
     /// just-spawned agy headless run until backfill (ADR-0002).
     pub native_id: Option<String>,
-    /// Human label (claude `--name`, agy `/rename`, or overstory-only).
+    /// Human label (claude `--name`, agy `/rename`, or swarm-tui-only).
     pub name: Option<String>,
     /// Working directory the session was started in. Load-bearing: claude's
     /// `--resume <id>` lookup is scoped to this cwd (+ its worktrees).

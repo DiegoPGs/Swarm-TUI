@@ -14,8 +14,8 @@ what did it cost.*
 
 ## Decision
 
-overstory keeps a **thin registry** (SQLite via `rusqlite`, one table to start) that
-maps an overstory session to `(tool, native_session_id, cwd, name, mode, status,
+swarm-tui keeps a **thin registry** (SQLite via `rusqlite`, one table to start) that
+maps an swarm-tui session to `(tool, native_session_id, cwd, name, mode, status,
 created_at, last_activity, last_cost_usd)` plus a dispatch-history table for the home
 timeline. **Native stores remain the single source of truth for transcripts and
 conversation state**; the registry never copies message content. Continuity is always
@@ -33,7 +33,7 @@ so no output parsing is needed to learn the ID.
   Claude's ID resolution is cwd-scoped — a cross-tool, cross-directory roster is
   impossible without at least a mapping layer. Also loses dispatch provenance and cost
   history.
-- **Full mirror (copy transcripts into overstory's DB).** Duplicates state that three
+- **Full mirror (copy transcripts into swarm-tui's DB).** Duplicates state that three
   fast-moving tools already own, in three formats (JSONL ×2 schemas, SQLite), with
   privacy weight (transcripts contain code) and a permanent sync problem. Nothing in
   the v1 UI needs transcript content — tabs render live PTYs.

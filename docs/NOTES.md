@@ -72,8 +72,70 @@ cc-switch, Crystal, Vibe Kanban (different product shapes), tui-term + portable-
 `node` present; no CLIs, no tmux, no cargo — reinforcing ADR-0005's single-binary,
 no-runtime-dependency stance for the eventual distribution.
 
-## For the fidelity spike (first implementation milestone)
+## Local verification — 2026-07-05 (first implementation session, target machine)
 
-Record here: per-CLI rendering defects under `vt100`, whether `wezterm-term` was
-needed, resize behavior under rapid streaming, and the verdict that either confirms
-ADR-0003 or triggers its fallback ladder.
+`scripts/verify-clis.sh` plus follow-up read-only probes on the CachyOS daily driver.
+Full detail is folded into `docs/integrations/*.md`; the deltas that matter:
+
+| Check | Result |
+| --- | --- |
+| Claude Code | **2.1.201** at `~/.local/bin/claude`, logged in; every scripted check green |
+| Antigravity CLI | **v1.0.14** at `~/.local/bin/agy` — *older* than the v1.0.16 the remote pass targeted; local flag surface matches the design's assumptions (still no structured output) |
+| Codex CLI | **not installed** (no binary on bash/fish PATH, no `~/.codex/`) — owner installs it manually; the probe-downgrade path covers the interim |
+| Rust toolchain | was absent → installed rustup **stable 1.96.1** user-locally with `--no-modify-path` (fish config untouched; add `~/.cargo/bin` to PATH by hand) |
+| Pinned dep set | resolves and type-checks together (ratatui 0.30.2 / tui-term 0.3.4 / portable-pty 0.9.0 / vt100 0.16.2 / rusqlite 0.40.1) |
+
+**ADR review of the divergences (first-session checklist step 3): none invalidated,
+no superseding ADR needed.**
+
+1. `claude mcp serve` **exists** at 2.1.201 — the current online command reference
+   omits it and misled the 2026-07-04 pass. This fires ADR-0001's "revisit when
+   Claude's command reference (re)documents an MCP server mode" trigger. Assessment:
+   `mcp serve` exposes Claude Code's *tools* over MCP, not whole-agent dispatch; agy
+   still has no server mode; stream-json remains the richer channel. The dual-channel
+   decision stands unchanged.
+2. agy's conversation store: `~/.gemini/antigravity-cli/conversations/` exists but is
+   empty (machine has never run an agy conversation) and no `*.db` exists under
+   `~/.gemini`. ADR-0002 already carries the fallback (serialize agy dispatch, lean on
+   `-c`) if ID backfill proves unreliable — nothing to supersede yet; the behavioral
+   tests are deferred to a supervised session because they write to the real store.
+3. Codex missing entirely is the ARCHITECTURE "CLI missing" failure mode working as
+   designed (probe downgrade + roster badge), not a decision change.
+
+Also this session: project renamed **overstory → swarm-tui** (owner's decision — the
+README "Naming" question is closed) and the pinned `[dependencies]` were enabled in
+`Cargo.toml`.
+
+## Fidelity spike results — 2026-07-05 (ADR-0003 gate: **PASSED**)
+
+`examples/fidelity_spike.rs` (`cargo run --example fidelity_spike`) spawns each
+installed CLI's real TUI in a `portable-pty` at 120×40, replays the byte stream
+through `vt100` 0.16.2, renders the parsed screen through `tui_term::PseudoTerminal`
+0.3.4 into an off-screen ratatui buffer, types characters (never Enter — nothing is
+submitted, no model call), resizes to 100×30, and snapshots every stage to
+`target/fidelity-spike/*.txt`.
+
+| | claude 2.1.201 (Ink/React) | agy 1.0.14 (Go) | codex |
+| --- | --- | --- | --- |
+| boot → stable paint | 1.2 s | 2.8 s | not installed — rerun after install |
+| render fidelity | block-art logo, box rules, status line, prompt box all exact | trust dialog, menu, model badge all exact | — |
+| typed-char echo | ✅ appears in the prompt box | n/a — boot lands on the workspace-trust *menu*, which ignores character keys (correct UX, not a defect) | — |
+| resize 120×40 → 100×30 | repaints exactly at the new width (separator rules re-render at 100 cols) | repaints cleanly | — |
+| tui-term buffer vs vt100 screen | 1 differing line = tui-term draws the cursor block `█` (a feature, not a defect) | 0 differing lines | — |
+| alt-screen / color | alt-screen ✅, 334 colored cells | alt-screen ✅, 122 colored cells | — |
+
+**Verdict: ADR-0003 confirmed. The pane layer stays on `vt100` + `tui-term` — no
+`wezterm-term`, no tmux fallback.** Zero rendering defects observed on either
+installed CLI.
+
+Carry-forwards for the real `src/pty/` layer:
+
+- agy's first open in a workspace lands on its trust dialog; a session tab just
+  renders it and lets the user answer (the "inherits its full UX including approval
+  prompts" property working as intended). The spike deliberately did not answer it.
+- Store side-effects of PTY spawn + kill: none. agy created no conversation row and
+  claude persisted no session file for a killed pre-prompt TUI (both re-checked by
+  filename listing after the run).
+- Not yet exercised — fold into the pane-layer build-out or a second spike pass:
+  mouse reporting, scrollback capture, resize under *rapid streaming* output (needs a
+  live turn, i.e. a supervised session), and codex entirely (blocked on install).

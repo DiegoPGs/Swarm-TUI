@@ -4,7 +4,7 @@
 //! tab must NOT kill the underlying CLI session unless the user says so
 //! (sessions outlive tabs; that is the whole point of the registry, ADR-0002).
 
-/// Identifier of an overstory-local session (registry primary key).
+/// Identifier of an swarm-tui-local session (registry primary key).
 pub type SessionId = u64;
 
 pub enum Tab {
@@ -21,7 +21,10 @@ pub struct Tabs {
 
 impl Tabs {
     pub fn new() -> Self {
-        Tabs { items: vec![Tab::Home], active: 0 }
+        Tabs {
+            items: vec![Tab::Home],
+            active: 0,
+        }
     }
 
     // TODO(next session): next/prev/close/promote(session_id) — "promote" is

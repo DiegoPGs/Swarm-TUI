@@ -119,7 +119,11 @@ pub enum AdapterKind {
 
 /// The adapter registry: iterate this to probe/list every known tool.
 pub fn registry() -> [AdapterKind; 3] {
-    [AdapterKind::ClaudeCode, AdapterKind::Antigravity, AdapterKind::Codex]
+    [
+        AdapterKind::ClaudeCode,
+        AdapterKind::Antigravity,
+        AdapterKind::Codex,
+    ]
 }
 
 impl AdapterKind {

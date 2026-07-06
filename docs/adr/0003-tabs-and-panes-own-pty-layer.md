@@ -51,7 +51,7 @@ simple panes.
 
 ## Consequences
 
-- overstory owns resize propagation, scrollback buffers, and copy-mode — real work,
+- swarm-tui owns resize propagation, scrollback buffers, and copy-mode — real work,
   scoped in `src/pty/`.
 - The fidelity spike is the riskiest unknown in the whole design and is deliberately
   scheduled first; its outcome is recorded in `docs/NOTES.md` and, if it triggers the

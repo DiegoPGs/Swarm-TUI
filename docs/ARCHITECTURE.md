@@ -3,12 +3,12 @@
 *Design date 2026-07-04. Decisions referenced here are argued in `docs/adr/`; per-CLI
 facts are sourced in `docs/integrations/`. This page describes how the pieces fit.*
 
-## What overstory is, in one paragraph
+## What swarm-tui is, in one paragraph
 
 A single Rust binary presenting a tabbed terminal UI. One tab is the **home view**
 (cross-agent roster, dispatch, broadcast). Every other tab is a **live interactive
 session** of one underlying CLI — the real `claude`, `agy`, or `codex` process running
-in a PTY that overstory owns and renders. Between the UI and the tools sits one trait,
+in a PTY that swarm-tui owns and renders. Between the UI and the tools sits one trait,
 `CliAdapter`, with three implementations. Underneath everything is a thin SQLite
 registry that remembers which native session ID lives behind which tab, so work can move
 between headless dispatch and interactive attention without losing the thread.
@@ -24,7 +24,7 @@ between headless dispatch and interactive attention without losing the thread.
 | Event bus | `src/core/events.rs` | normalized `AgentEvent` stream fanned into UI + registry | no |
 | Adapters | `src/adapters/` | everything tool-specific: flags, spawning, parsing, probing | **yes — only here** |
 | PTY host | `src/pty/` | spawn/resize/kill PTY children, vt100 grid state (`tui-term`) | no |
-| Registry | `src/store/` | SQLite: overstory session ↔ native session ID + metadata | schema only |
+| Registry | `src/store/` | SQLite: swarm-tui session ↔ native session ID + metadata | schema only |
 | Capability probe | `src/adapters/mod.rs` | startup `--version`/`--help` checks → `AdapterCaps` | yes |
 
 ## The two channels (ADR-0001)
@@ -94,7 +94,7 @@ At startup each adapter runs `<tool> --version` and greps `<tool> --help` for th
 it depends on, producing an `AdapterCaps` (headless? structured output? resume-by-id?
 background supervisor?). A failed probe never disables an adapter — it degrades it to
 interactive-only with a visible badge in the roster. This is the mechanism that keeps
-overstory honest as all three tools ship weekly, and it's what makes a minimum viable
+swarm-tui honest as all three tools ship weekly, and it's what makes a minimum viable
 fourth adapter "a spawn command plus a probe" (ADR-0006).
 
 ## Failure modes considered

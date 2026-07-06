@@ -13,13 +13,13 @@ each CLI's top-level session as one agent and route between the three.
 
 ## Decision
 
-**Peer-agent composition.** The unit overstory orchestrates is a *top-level session* of
+**Peer-agent composition.** The unit swarm-tui orchestrates is a *top-level session* of
 one CLI. The router dispatches tasks to peers, broadcasts to several, and (later)
 chains them — it never enumerates, spawns, schedules, or messages another tool's
 internal subagents. Whatever subagent fan-out a tool performs inside a session is that
-tool's private business; overstory sees it only as that session's activity.
+tool's private business; swarm-tui sees it only as that session's activity.
 
-One deliberate exception at the **provisioning** level, not runtime: overstory may drop
+One deliberate exception at the **provisioning** level, not runtime: swarm-tui may drop
 static context files into a working directory before dispatch — notably `AGENTS.md`,
 which Claude Code (via the CLAUDE.md shim convention), Codex, and Antigravity all read
 natively. Writing files a tool reads on startup is configuration, not orchestration.
@@ -35,7 +35,7 @@ natively. Writing files a tool reads on startup is configuration, not orchestrat
   fan-out already approximates.
 - **Adopting one tool's subagent system as the meta-orchestrator** (e.g., Claude Code
   agent teams driving codex/agy as tools). Genuinely attractive — Claude's supervisor
-  and teams are strong — but it makes overstory a Claude plugin rather than a neutral
+  and teams are strong — but it makes swarm-tui a Claude plugin rather than a neutral
   layer, couples the home view to one vendor's roadmap, and inverts the product: the
   brief wants the orchestrator above all three, with each replaceable.
 

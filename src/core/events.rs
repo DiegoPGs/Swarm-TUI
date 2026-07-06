@@ -23,7 +23,10 @@ pub enum AgentEvent {
     /// broadcast compare view. Human-readable one-liner, not raw payload.
     ToolActivity(String),
     /// Terminal success. `cost_usd` only where the tool reports it (claude).
-    Completed { result: String, cost_usd: Option<f64> },
+    Completed {
+        result: String,
+        cost_usd: Option<f64>,
+    },
     /// Terminal failure: non-zero exit, budget stop, `turn.failed`, timeout.
     Failed { reason: String },
 }

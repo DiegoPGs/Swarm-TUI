@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Task {
     pub prompt: String,
-    /// cwd is a property of the TASK, not of overstory — every dispatch names
+    /// cwd is a property of the TASK, not of swarm-tui — every dispatch names
     /// its working directory explicitly.
     pub cwd: PathBuf,
     pub budget: Budget,

@@ -4,6 +4,15 @@ Verified 2026-07-04 against developers.openai.com/codex (official reference, fea
 non-interactive pages), npm latest **0.142.5**. ✅ = official docs; 🔶 = reputable
 secondary / upstream issue tracker; ⬜ = **verify locally**.
 
+**Local verification 2026-07-05: NOT INSTALLED.** `codex` is on neither bash nor fish
+PATH, `~/.codex/` does not exist, and no npm/pnpm/bun global or pacman package
+provides it (node/npm themselves are present). Every ✅ below remains remote-verified
+at 0.142.5; every ⬜ is **blocked until the owner installs Codex CLI** — swarm-tui's
+boundary forbids installing or updating the wrapped CLIs itself. After installing
+(e.g. `npm install -g @openai/codex`), re-run `scripts/verify-clis.sh` and settle this
+page's ⬜ items. Until then the adapter probe reports codex unavailable and the roster
+badges it (the ARCHITECTURE "CLI missing" failure mode — no design impact).
+
 ## Invocation
 
 - ✅ Interactive: `codex` (Rust/ratatui TUI), `codex resume [--last|--all|<id>]`
@@ -25,7 +34,7 @@ secondary / upstream issue tracker; ⬜ = **verify locally**.
 - ✅ Rollouts stored as JSONL under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`;
   IDs visible in the picker, `/status`, and filenames.
 - 🔶 **No headless fork**: `codex fork` is TUI-only (upstream issue #11750, open as of
-  Feb 2026). Fine for overstory — promotion to a tab is interactive by definition —
+  Feb 2026). Fine for swarm-tui — promotion to a tab is interactive by definition —
   but rules out headless branch-and-compare on Codex for now. The `app-server`
   JSON-RPC exposes `thread/fork` if that ever matters.
 - ⬜ Exact `thread.started` payload field names at the installed version (capture one
@@ -40,7 +49,7 @@ secondary / upstream issue tracker; ⬜ = **verify locally**.
   `AGENTS.md` for project context).
 - ✅ Auth: `codex login`, stored in `~/.codex/auth.json` (ChatGPT account or API key);
   `codex exec` **reuses saved CLI authentication by default** — exactly the reuse
-  overstory needs. `CODEX_API_KEY` env override exists for exec only (not used).
+  swarm-tui needs. `CODEX_API_KEY` env override exists for exec only (not used).
 
 ## Guardrails
 

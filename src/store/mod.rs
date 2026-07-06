@@ -1,12 +1,12 @@
 //! Session registry (ADR-0002): a thin SQLite mapping, not a session store.
 //!
-//! Owns: overstory-id ↔ (tool slug, native id, cwd, name, mode, status,
+//! Owns: swarm-tui-id ↔ (tool slug, native id, cwd, name, mode, status,
 //! timestamps, cost) + dispatch history. Does NOT own transcripts, agent
 //! state, or anything the native tools already persist.
 //!
 //! Reconciliation contract (runs at startup, read-only against the tools):
 //! - Claude Code: `claude agents --json --all` → merge native background
-//!   sessions into the roster, even ones overstory never started.
+//!   sessions into the roster, even ones swarm-tui never started.
 //! - All tools: rows whose native session can't be found are marked
 //!   `SessionStatus::Orphaned` — never auto-deleted, never cascade anything.
 //! - agy backfill lane: headless runs that produced no native id get one

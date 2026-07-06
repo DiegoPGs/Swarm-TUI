@@ -27,19 +27,13 @@ MAINTENANCE
 (`docs/adr/`) → the integration page for any CLI you'll touch
 (`docs/integrations/`) → `docs/NOTES.md` for what's verified vs. inferred.
 
-**First implementation session — do this before writing any code:**
-
-1. Run `./scripts/verify-clis.sh` on this machine (the design session ran in a sandbox
-   without the three CLIs installed; every fact marked *verify locally* in
-   `docs/integrations/` is waiting on this).
-2. Update the three integration pages: flip confirmed items to ✅ with the observed
-   version, correct anything that diverged, and record exact session-store paths.
-3. If a divergence invalidates part of an ADR, write a superseding ADR — don't silently
-   design around it.
-4. Only then: `cargo init` housekeeping (`cargo check` against the pinned deps) and the
-   ADR-0003 fidelity spike (render each CLI's TUI through `portable-pty` + `tui-term`
-   and note rendering defects). The spike result decides whether the pane layer stays
-   on `vt100` or moves to the documented fallback.
+**First implementation session (2026-07-05): ✅ done.** The verify pass, the
+integration-page updates, the ADR divergence review (nothing needed superseding),
+dependency enablement, and the ADR-0003 fidelity spike (**passed** — the pane layer
+stays on `vt100` + `tui-term`) are all recorded in `docs/NOTES.md`. One gap remains:
+**Codex CLI is not installed on this machine.** After the owner installs it, re-run
+`./scripts/verify-clis.sh`, settle the ⬜ items in `docs/integrations/codex.md`, and
+re-run `cargo run --example fidelity_spike`.
 
 **Working style in this repo:** use plan mode for any change under `src/adapters/` or
 to the `CliAdapter` trait; those are the contract surfaces. Background/long tasks are

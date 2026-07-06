@@ -38,8 +38,8 @@ driving any CLI's internal subagent system (ADR-0004); transcript browsing/repla
 
 ## Open questions for the owner
 
-1. **Name.** `overstory`, `switchboard`, or `sindicato` (README has the rationale) —
-   the crate rename is one commit, do it before first push.
+1. **Name.** ~~Open~~ **Decided 2026-07-05: `swarm-tui`** (owner's pick; the design
+   session's working name was *overstory* — see README "Naming"). Crate renamed.
 2. **License posture.** MIT scaffolded as the low-friction default; if this is ever
    public and the anti-enclosure instinct matters more than adoption friction, switch
    to GPLv3/AGPL *now*, while there are no outside contributors.
@@ -47,7 +47,7 @@ driving any CLI's internal subagent system (ADR-0004); transcript browsing/repla
    (e.g., same review prompt to all three) vs. plan→implement pipelines vs. pure
    roster/dispatch. v1 assumes roster+dispatch+broadcast; reorder if wrong.
 4. **Worktree isolation.** Should home-view dispatch default to a fresh git worktree
-   per task (Claude has `-w` native; Codex/agy would need overstory to create it), or
+   per task (Claude has `-w` native; Codex/agy would need swarm-tui to create it), or
    run in-place? In-place assumed for v1; worktrees are the obvious v2 safety upgrade.
 5. **agy under quota.** Given shared-quota burn (see integration page), should
    broadcast exclude agy by default and require opting it in per task?
