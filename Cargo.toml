@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 description = "One terminal above Claude Code, Antigravity CLI, and Codex CLI: session tabs per tool, a home view for cross-agent dispatch."
 license = "MIT"
-repository = ""                       # set on first push
+repository = "https://github.com/DiegoPGs/Swarm-TUI"
 rust-version = "1.75"
 
 # Versions verified live on crates.io on 2026-07-04 and enabled on 2026-07-05
