@@ -72,3 +72,6 @@ anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that the
   "reuse existing login" requirement; do not use it as the default dispatch mode.
 - `codex exec` defaults to a **read-only sandbox** and refuses to run outside a git
   repository (`--skip-git-repo-check` to override); plan guardrail defaults accordingly.
+- A `claude` spawned from inside another Claude Code session inherits `CLAUDECODE`/
+  `CLAUDE_CODE_*` env vars and changes behavior; any PTY spawn of a wrapped CLI must
+  scrub those vars and set a plain `TERM` (pattern: `examples/fidelity_spike.rs`).
