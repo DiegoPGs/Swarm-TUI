@@ -16,9 +16,8 @@ pub struct SwarmTuiConfig {
 }
 
 impl SwarmTuiConfig {
-    /// TODO(next session): resolve via the `directories` crate (Cargo.toml has
-    /// the pinned version commented) + optional `OVERSTORY_DATA_DIR` override
-    /// for tests.
+    /// TODO(next session): resolve via the `directories` crate + optional
+    /// `SWARM_TUI_DATA_DIR` override for tests.
     pub fn resolve() -> Result<Self, String> {
         todo!("resolve XDG paths once the `directories` dep is enabled")
     }
