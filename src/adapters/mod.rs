@@ -117,7 +117,13 @@ pub trait CliAdapter {
 /// Compile-time dispatch over the built-in adapters — no `dyn`, no
 /// `async-trait` (ADR-0006). Adding a tool = add a variant + module; the
 /// exhaustive matches below make every missing integration a compile error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` is derived so `app` can key a probe-result cache by kind
+/// (`HashMap<AdapterKind, Result<AdapterCaps, AdapterError>>`) — this is the
+/// one narrow, pre-authorized exception to "app never names a specific CLI":
+/// `app` matches on `AdapterKind` only to decide the claude native_id-hint
+/// prepopulation, never to branch on flags/behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdapterKind {
     ClaudeCode,
     Antigravity,
@@ -203,5 +209,28 @@ impl CliAdapter for AdapterKind {
             AdapterKind::Antigravity => antigravity::Antigravity.follow_up(session, task),
             AdapterKind::Codex => codex::Codex.follow_up(session, task),
         }
+    }
+}
+
+/// Shared probe primitive: run `<binary> <args>` and capture the raw output.
+/// Every adapter's `probe()` funnels through this — the only I/O the probe
+/// path performs is `--version`/`--help` invocations (AGENTS.md boundary:
+/// never touch credential/config file contents).
+pub(crate) fn command_output(binary: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new(binary).args(args).output()
+}
+
+/// `--help`-shaped output as one string (stdout + stderr concatenated, since
+/// some CLIs print help/usage to stderr): empty string if the command
+/// couldn't even run, so callers can treat "not found" and "printed nothing"
+/// uniformly as "no flags confirmed present".
+pub(crate) fn help_text(binary: &str, args: &[&str]) -> String {
+    match command_output(binary, args) {
+        Ok(out) => format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(_) => String::new(),
     }
 }

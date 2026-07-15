@@ -40,11 +40,42 @@ impl CliAdapter for Codex {
     }
 
     fn probe(&self) -> Result<AdapterCaps, AdapterError> {
-        // TODO(next session): `codex --version` (tolerate alpha strings);
-        // check `codex exec --help` for --json / -o / --output-schema and
-        // `codex exec resume --help` existence. Record ⬜ answers ([agents]
-        // block, repo-local .codex/) in the integration page.
-        todo!("probe installed codex against EXPECTED_CAPS")
+        // `codex --version` (tolerated: npm ships per-platform + alpha
+        // strings, e.g. `0.142.5-linux-x64` — we don't parse the string,
+        // just confirm the binary runs and exits 0).
+        let version = super::command_output(self.binary(), &["--version"])
+            .map_err(|e| AdapterError::Probe(format!("codex --version failed to run: {e}")))?;
+        if !version.status.success() {
+            return Err(AdapterError::Probe(format!(
+                "codex --version exited with {:?}",
+                version.status.code()
+            )));
+        }
+
+        let exec_help = super::help_text(self.binary(), &["exec", "--help"]);
+        let structured_output = if exec_help.contains("--json") {
+            EXPECTED_CAPS.structured_output
+        } else {
+            StructuredOutput::None
+        };
+
+        // `codex exec resume --help` existing (non-error exit) is the
+        // positive-existence check per the task spec, distinct from a text
+        // grep — resume is a subcommand, not a flag.
+        let resume_help_ok = super::command_output(self.binary(), &["exec", "resume", "--help"])
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        let resume = if resume_help_ok {
+            EXPECTED_CAPS.resume
+        } else {
+            ResumeSupport::None
+        };
+
+        Ok(AdapterCaps {
+            structured_output,
+            resume,
+            background_supervisor: EXPECTED_CAPS.background_supervisor,
+        })
     }
 
     fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
