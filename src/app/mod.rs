@@ -12,6 +12,7 @@
 
 pub mod home;
 pub mod keys;
+pub mod reconcile;
 pub mod session_view;
 pub mod tabs;
 
@@ -32,6 +33,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
+use crate::adapters::claude_code::ClaudeCode;
 use crate::adapters::{self, AdapterCaps, AdapterError, AdapterKind, CliAdapter};
 use crate::core::config::SwarmTuiConfig;
 use crate::core::session::{SessionMode, SessionRecord, SessionStatus};
@@ -172,13 +174,67 @@ pub struct App {
     pane_area_size: PaneSize,
 }
 
+/// Query Claude Code's native background-agent supervisor (ADR-0002
+/// reconciliation, Stage D) if the claude probe succeeded — no point
+/// shelling out to a binary this machine doesn't have. The blocking `claude
+/// agents --json --all` subprocess itself runs via `tokio::task::
+/// spawn_blocking` so a slow or hung `claude` never stalls the
+/// input-handling side of the event loop.
+///
+/// Free function (not `App::`) so `bootstrap` can call it before an `App`
+/// exists yet. Naming `ClaudeCode` here is a narrow, pre-authorized
+/// exception to the module doc's "`app` almost never knows CLIs" rule —
+/// exactly like the existing `AdapterKind` match for the claude
+/// native_id-hint: `list_background_agents` is Claude-Code-specific by
+/// design (it's an inherent method, not on `CliAdapter`), and reconciliation
+/// has to name it somewhere.
+async fn reconciled_claude_agents(
+    probe_cache: &HashMap<AdapterKind, Result<AdapterCaps, AdapterError>>,
+) -> Vec<RosterEntry> {
+    let claude_probe_ok = matches!(probe_cache.get(&AdapterKind::ClaudeCode), Some(Ok(_)));
+    if !claude_probe_ok {
+        return Vec::new();
+    }
+
+    let values = match tokio::task::spawn_blocking(|| ClaudeCode.list_background_agents()).await {
+        Ok(Ok(values)) => values,
+        Ok(Err(e)) => {
+            tracing::warn!("claude agents --json --all failed: {e:?}");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::warn!("claude agents --json --all: background task join error: {e}");
+            return Vec::new();
+        }
+    };
+
+    // Re-serialize the already shape-normalized `Vec<Value>` so the single
+    // per-entry defensive parser (`reconcile::parse_agents_json`, unit
+    // tested against a fixture) stays the one place that knows the
+    // id/session_id/name/status field-mapping rules.
+    let raw = match serde_json::to_string(&values) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!("failed to re-serialize claude agents --json --all output: {e}");
+            return Vec::new();
+        }
+    };
+
+    reconcile::parse_agents_json(&raw)
+        .into_iter()
+        .map(reconcile::to_roster_entry)
+        .collect()
+}
+
 impl App {
     /// Probe every adapter (cached for the app's lifetime — probes are
     /// `--version`/`--help` child processes, not free), open the registry,
-    /// and load the initial roster. Returns the pane-change notification
-    /// receiver alongside the app since `LocalPaneHost::new()` hands that
-    /// back separately (a handful of tabs doesn't need per-pane channels).
-    pub fn bootstrap(
+    /// and load the initial roster — plus, if the claude probe succeeded,
+    /// Claude Code's native background agents (Stage D, ADR-0002
+    /// reconciliation). Returns the pane-change notification receiver
+    /// alongside the app since `LocalPaneHost::new()` hands that back
+    /// separately (a handful of tabs doesn't need per-pane channels).
+    pub async fn bootstrap(
         config: &SwarmTuiConfig,
     ) -> Result<(App, UnboundedReceiver<PaneId>), AppError> {
         let mut probe_cache = HashMap::new();
@@ -188,7 +244,10 @@ impl App {
 
         let registry = Registry::open(&config.registry_db)?;
         let roster = registry.all()?;
-        let home = HomeView::new(roster.into_iter().map(RosterEntry::Registered).collect());
+        let mut roster: Vec<RosterEntry> =
+            roster.into_iter().map(RosterEntry::Registered).collect();
+        roster.extend(reconciled_claude_agents(&probe_cache).await);
+        let home = HomeView::new(roster);
 
         let (pane_host, pane_changed_rx) = LocalPaneHost::new();
 
@@ -410,7 +469,7 @@ impl App {
         }
 
         match self.input_mode {
-            InputMode::AwaitingCommand => self.handle_command_key(key),
+            InputMode::AwaitingCommand => self.handle_command_key(key).await,
             InputMode::Normal => {
                 self.handle_normal_key(key);
                 false
@@ -452,7 +511,11 @@ impl App {
     /// Dispatch the ADR-0007 keymap. Always returns to `Normal` mode; the
     /// bool return means "quit now" (only true for `q` with no panes alive —
     /// the confirmed path goes through `pending_confirm` instead).
-    fn handle_command_key(&mut self, key: KeyEvent) -> bool {
+    ///
+    /// `async` (Stage D) only because the `r` arm now also reconciles
+    /// Claude Code's native background agents, which shells out via
+    /// `tokio::task::spawn_blocking`; every other arm is still synchronous.
+    async fn handle_command_key(&mut self, key: KeyEvent) -> bool {
         self.input_mode = InputMode::Normal;
         let mut quit_now = false;
         match key.code {
@@ -487,7 +550,14 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
+                // Registry-backed rows first, then re-run reconciliation
+                // (Stage D, ADR-0002) and fold the `ReconciledOnly` rows in
+                // additively — never dropping the `Registered` rows
+                // `refresh_roster` just rebuilt, never inventing a registry
+                // row for a reconciled-only entry.
                 let _ = self.refresh_roster();
+                let reconciled = reconciled_claude_agents(&self.probe_cache).await;
+                self.home.roster.extend(reconciled);
             }
             KeyCode::Char('?') => {
                 self.show_keymap_overlay = !self.show_keymap_overlay;
@@ -749,7 +819,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// the terminal on the way out (`TerminalGuard`'s `Drop` covers both a
 /// normal `break` and a propagated error).
 pub async fn run(config: SwarmTuiConfig) -> Result<(), AppError> {
-    let (mut app, mut pane_changed_rx) = App::bootstrap(&config)?;
+    let (mut app, mut pane_changed_rx) = App::bootstrap(&config).await?;
 
     install_panic_hook();
     let _guard = TerminalGuard::new()?;

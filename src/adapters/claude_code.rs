@@ -149,3 +149,62 @@ impl CliAdapter for ClaudeCode {
         todo!("headless follow-up via -p --resume (ADR-0001/0002)")
     }
 }
+
+impl ClaudeCode {
+    /// Native background-agent reconciliation source (ADR-0002): `claude
+    /// agents --json --all` lists both running and completed background
+    /// sessions as JSON, and — per its own `--help` at 2.1.201 (confirmed
+    /// locally 2026-07-05, see `docs/integrations/claude-code.md`) — doesn't
+    /// require a TTY. Inherent (not part of `CliAdapter`) because this
+    /// capability is Claude-Code-specific; no other adapter has an
+    /// equivalent native supervisor.
+    ///
+    /// Read-only, one-shot, non-interactive: no stdin is written, nothing is
+    /// sent to any interactive prompt. There is no documented field-level
+    /// schema for the JSON this prints (only the prose above), so this
+    /// method only resolves the *top-level* shape — bare array, or an object
+    /// wrapping the array under `"agents"`/`"sessions"` — and hands the
+    /// per-entry values back unparsed; `crate::app::reconcile::parse_agents_json`
+    /// does the lenient per-entry extraction.
+    pub fn list_background_agents(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+        let output =
+            super::command_output(self.binary(), &["agents", "--json", "--all"]).map_err(|e| {
+                AdapterError::Probe(format!("claude agents --json --all failed to run: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(AdapterError::Probe(format!(
+                "claude agents --json --all exited with {:?}",
+                output.status.code()
+            )));
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            AdapterError::Probe(format!(
+                "claude agents --json --all produced invalid JSON: {e}"
+            ))
+        })?;
+
+        match value {
+            serde_json::Value::Array(items) => Ok(items),
+            serde_json::Value::Object(mut map) => {
+                if let Some(serde_json::Value::Array(items)) = map.remove("agents") {
+                    Ok(items)
+                } else if let Some(serde_json::Value::Array(items)) = map.remove("sessions") {
+                    Ok(items)
+                } else {
+                    Err(AdapterError::Probe(
+                        "claude agents --json --all: object output had neither an \
+                         'agents' nor a 'sessions' array"
+                            .to_string(),
+                    ))
+                }
+            }
+            _ => Err(AdapterError::Probe(
+                "claude agents --json --all: unexpected top-level JSON shape \
+                 (not an array or object)"
+                    .to_string(),
+            )),
+        }
+    }
+}

@@ -1,0 +1,28 @@
+[
+  {
+    "id": "fce17a07-840b-4f83-8aef-da36f14bedf7",
+    "name": "test-session-alpha",
+    "status": "running"
+  },
+  {
+    "session_id": "661c6bf1-b7e0-48c0-a653-eebcd0699a84",
+    "name": "test-session-beta",
+    "status": "completed"
+  },
+  {
+    "id": "d5de3421-1c07-4224-9847-dbbd95bc6979",
+    "status": "running"
+  },
+  {
+    "name": "test-session-missing-id",
+    "status": "completed"
+  },
+  {
+    "sessionId": "0b6f0a5e-2c9c-4c1e-9a2f-5b7d0f6a9c3e",
+    "pid": 84213,
+    "cwd": "/home/user/example-project",
+    "kind": "background",
+    "startedAt": 1799999999,
+    "name": "test-session-gamma"
+  }
+]
