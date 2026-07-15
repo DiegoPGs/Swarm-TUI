@@ -42,6 +42,13 @@ were flipped or re-confirmed against the live binary that day.
   `logs`, `stop`, `respawn`, `rm`, and `daemon` all answer `--help` at 2.1.201.
   The last six are hidden from top-level `--help` but real; `claude agents --json`
   is documented in its own help as not requiring a TTY (with `--all` for completed).
+  ✅ *(local 2026-07-15)* `claude agents --json --all` output shape, field names only
+  (no session content recorded, per AGENTS.md): top level is a bare JSON array (not
+  wrapped in an object). Entry fields observed: `sessionId` (camelCase — **not**
+  `id` or `session_id`), `pid`, `cwd`, `kind`, `startedAt`, `name`. There is **no
+  `status` field** in the entries observed. swarm-tui's reconciliation parser
+  (`src/app/reconcile.rs`) accepts `id`/`session_id`/`sessionId` defensively and
+  defaults `status` to `"unknown"` when absent, since absence is the common case.
 - ✅ *(local 2026-07-05)* Transcript store layout confirmed on disk:
   `~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl`, where `<cwd-slug>` is the
   absolute working directory with `/` → `-` (this repo →

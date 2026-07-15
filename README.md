@@ -17,12 +17,51 @@ and **Codex CLI** (`codex`) — and turns them into one workspace:
 
 ## Status
 
-**Architecture and scaffold only — no runnable orchestration logic yet.** This repo is
-the output of a design-and-research session (2026-07-04). Read
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design,
-[`docs/adr/`](docs/adr/) for the six decisions and their rejected alternatives, and
-[`docs/NOTES.md`](docs/NOTES.md) for what was verified against official docs versus what
-still needs confirmation on the target machine (`scripts/verify-clis.sh` does that pass).
+**Milestone 2a (the shell) is implemented as of 2026-07-15.** `cargo run` boots a
+real, interactive terminal shell — tabs, a home roster, and live PTY sessions for
+Claude Code, Antigravity CLI, and Codex CLI (a tool degrades to a greyed-out badge
+if its probe fails, never disappears), plus Claude Code background-agent
+reconciliation. Headless dispatch (`dispatch()`/`follow_up()`), broadcast,
+pipelines, and MCP integration are not implemented yet — deferred to a later
+milestone. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design,
+[`docs/adr/`](docs/adr/) for the seven decisions and their rejected alternatives,
+and [`docs/NOTES.md`](docs/NOTES.md) for what's verified against official docs
+versus what's inferred (`scripts/verify-clis.sh` does the local verification pass).
+
+## Quickstart
+
+Requires the CLIs you want to use already installed and logged in locally
+(`claude`, `agy`, and/or `codex` on `PATH`) — swarm-tui never installs or
+authenticates them.
+
+```
+cargo run
+```
+
+Boots straight into the Home tab. Press `Ctrl-Space` then `c` to open a new
+session tab for any installed tool (uninstalled tools are greyed out, not
+hidden). See the keymap below for everything else.
+
+## Keymap
+
+Press **Ctrl-Space** to enter the one-shot command mode, then press one of:
+
+| Key | Action |
+| --- | --- |
+| `h` / `0` | Home |
+| `1`-`9` | Jump to tab N |
+| `n` / `p` | Cycle to next / previous tab |
+| `c` | New session |
+| `d` | Detach |
+| `x` | Close tab (confirm) |
+| `r` | Refresh roster |
+| `?` | Keymap overlay |
+| `q` | Quit (confirm if any pane is alive; quitting kills remaining panes after confirmation) |
+
+Pressing Ctrl-Space twice sends one literal Ctrl-Space byte through to the pane
+instead of dispatching a command — the escape hatch for a wrapped tool that itself
+binds Ctrl-Space. Full rationale in
+[`docs/adr/0007-input-routing-and-prefix-key.md`](docs/adr/0007-input-routing-and-prefix-key.md).
 
 ## The shape of it
 

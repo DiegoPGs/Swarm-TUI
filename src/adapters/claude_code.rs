@@ -44,19 +44,76 @@ impl CliAdapter for ClaudeCode {
     }
 
     fn probe(&self) -> Result<AdapterCaps, AdapterError> {
-        // TODO(next session): `claude --version`; grep `--help` for
-        // -p/--output-format/--resume/--session-id/--bg/--max-budget-usd
-        // (NB: claude's --help deliberately omits some flags — treat absence
-        // as "unknown", fall back to EXPECTED_CAPS fields individually, and
-        // record findings in the integration page). Also `claude auth status`
-        // exit code as the logged-in check for the doctor view.
-        todo!("probe installed claude against EXPECTED_CAPS")
+        let version = super::command_output(self.binary(), &["--version"])
+            .map_err(|e| AdapterError::Probe(format!("claude --version failed to run: {e}")))?;
+        if !version.status.success() {
+            return Err(AdapterError::Probe(format!(
+                "claude --version exited with {:?}",
+                version.status.code()
+            )));
+        }
+
+        let help = super::help_text(self.binary(), &["--help"]);
+        let has = |flag: &str| help.contains(flag);
+
+        // docs/integrations/claude-code.md's own warning: `--help` at 2.1.201
+        // deliberately hides some real flags (observed: --max-turns), so
+        // "absent from --help" is not automatically "unavailable" in general.
+        // But none of the six flags this probe checks are on that
+        // known-hidden list — the doc's 2026-07-05 local pass positively
+        // confirms -p, --output-format, --resume, --session-id, --bg, and
+        // --max-budget-usd all appear in top-level `--help` at the verified
+        // version. So for *these* flags specifically, absence is a genuine
+        // signal worth downgrading on, exactly like agy's --output-format
+        // case — only truly-hidden-but-documented flags (not checked here)
+        // get the "unknown, trust the doc" treatment.
+        let has_print = has("-p") || has("--print");
+        let has_output_format = has("--output-format");
+        let has_resume = has("--resume");
+        let has_session_id = has("--session-id");
+        let has_bg = has("--bg") || has("--background");
+        let has_max_budget = has("--max-budget-usd");
+
+        // has_print/has_max_budget don't map to an `AdapterCaps` field (the
+        // struct only tracks structured_output/resume/background_supervisor)
+        // but are still worth confirming — a probe that can't even find `-p`
+        // would mean the whole headless channel assumption is broken, which
+        // should show up as a probe failure rather than a silent downgrade.
+        if !has_print {
+            return Err(AdapterError::Probe(
+                "claude --help no longer lists -p/--print — headless channel assumption is broken"
+                    .to_string(),
+            ));
+        }
+
+        let structured_output = if has_output_format {
+            EXPECTED_CAPS.structured_output
+        } else {
+            StructuredOutput::None
+        };
+        let resume = if has_resume || has_session_id {
+            EXPECTED_CAPS.resume
+        } else {
+            ResumeSupport::None
+        };
+        let background_supervisor = has_bg;
+        let _ = has_max_budget; // confirmed present when checked; no cap field to downgrade
+
+        Ok(AdapterCaps {
+            structured_output,
+            resume,
+            background_supervisor,
+        })
     }
 
     fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
         match intent {
-            LaunchIntent::Fresh => {}
+            LaunchIntent::Fresh { session_id_hint } => {
+                if let Some(hint) = session_id_hint {
+                    cmd.arg("--session-id").arg(hint);
+                }
+            }
             // Gotcha: `--resume <id>` lookup is scoped to cwd (+ worktrees) —
             // the registry's stored cwd is what makes this reliable.
             LaunchIntent::Resume { native_id } => {
@@ -90,5 +147,64 @@ impl CliAdapter for ClaudeCode {
         // TODO(next session): same as dispatch but `--resume <native_id>`;
         // MUST run in the session's recorded cwd or the id won't be found.
         todo!("headless follow-up via -p --resume (ADR-0001/0002)")
+    }
+}
+
+impl ClaudeCode {
+    /// Native background-agent reconciliation source (ADR-0002): `claude
+    /// agents --json --all` lists both running and completed background
+    /// sessions as JSON, and — per its own `--help` at 2.1.201 (confirmed
+    /// locally 2026-07-05, see `docs/integrations/claude-code.md`) — doesn't
+    /// require a TTY. Inherent (not part of `CliAdapter`) because this
+    /// capability is Claude-Code-specific; no other adapter has an
+    /// equivalent native supervisor.
+    ///
+    /// Read-only, one-shot, non-interactive: no stdin is written, nothing is
+    /// sent to any interactive prompt. There is no documented field-level
+    /// schema for the JSON this prints (only the prose above), so this
+    /// method only resolves the *top-level* shape — bare array, or an object
+    /// wrapping the array under `"agents"`/`"sessions"` — and hands the
+    /// per-entry values back unparsed; `crate::app::reconcile::parse_agents_json`
+    /// does the lenient per-entry extraction.
+    pub fn list_background_agents(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+        let output =
+            super::command_output(self.binary(), &["agents", "--json", "--all"]).map_err(|e| {
+                AdapterError::Probe(format!("claude agents --json --all failed to run: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(AdapterError::Probe(format!(
+                "claude agents --json --all exited with {:?}",
+                output.status.code()
+            )));
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            AdapterError::Probe(format!(
+                "claude agents --json --all produced invalid JSON: {e}"
+            ))
+        })?;
+
+        match value {
+            serde_json::Value::Array(items) => Ok(items),
+            serde_json::Value::Object(mut map) => {
+                if let Some(serde_json::Value::Array(items)) = map.remove("agents") {
+                    Ok(items)
+                } else if let Some(serde_json::Value::Array(items)) = map.remove("sessions") {
+                    Ok(items)
+                } else {
+                    Err(AdapterError::Probe(
+                        "claude agents --json --all: object output had neither an \
+                         'agents' nor a 'sessions' array"
+                            .to_string(),
+                    ))
+                }
+            }
+            _ => Err(AdapterError::Probe(
+                "claude agents --json --all: unexpected top-level JSON shape \
+                 (not an array or object)"
+                    .to_string(),
+            )),
+        }
     }
 }

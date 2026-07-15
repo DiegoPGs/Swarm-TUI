@@ -13,6 +13,8 @@
 
 use std::process::Command;
 
+pub mod local;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u64);
 
@@ -37,10 +39,25 @@ pub trait PaneHost {
     /// panes).
     fn is_exited(&self, pane: PaneId) -> bool;
 
-    // TODO(next session): the render surface. Deliberately unspecified until
-    // the spike — likely `fn screen(&self, pane) -> &vt100::Screen` consumed
-    // by a tui-term widget, but that signature is exactly what the spike must
-    // validate.
+    /// Render surface: locks the pane's parser only for the duration of `f`,
+    /// so no lock-guard type leaks across the trait boundary (needed because
+    /// the parser is mutated by a background reader thread — see
+    /// `LocalPaneHost`).
+    fn with_screen<R>(
+        &self,
+        pane: PaneId,
+        f: impl FnOnce(&vt100::Screen) -> R,
+    ) -> Result<R, PaneError>;
+
+    /// Kill the PTY child. Must never touch anything the native wrapped tool
+    /// persisted itself — this only tears down the local PTY process.
+    fn kill(&mut self, pane: PaneId) -> Result<(), PaneError>;
+
+    /// `None` while running. `Some(true)` once the child exited with code 0,
+    /// `Some(false)` for any other exit (nonzero code, killed, signaled).
+    /// Distinct from `is_exited` so a caller can tell "still running" from
+    /// "exited, need the reason".
+    fn exit_success(&self, pane: PaneId) -> Option<bool>;
 }
 
 #[derive(Debug)]

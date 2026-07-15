@@ -139,3 +139,63 @@ Carry-forwards for the real `src/pty/` layer:
 - Not yet exercised — fold into the pane-layer build-out or a second spike pass:
   mouse reporting, scrollback capture, resize under *rapid streaming* output (needs a
   live turn, i.e. a supervised session), and codex entirely (blocked on install).
+
+## Milestone 2a complete — 2026-07-15 (Stage E, final stage of "the shell")
+
+Stages A1 through E all landed this milestone: registry + XDG config (A1, `c655e5e`),
+the PTY layer / `LocalPaneHost` (A2, `d99bf58`), the `LaunchIntent::Fresh` breaking
+change + ADR-0007 (B, `23aa327` + `cdc0ede`), the full app shell (C, `2862b03`), Claude
+Code background-agent reconciliation (D, `9cbf488`), and this stage's CI workflow plus
+docs pass (E). `cargo run` now boots a real terminal shell instead of a scaffold.
+
+**`LaunchIntent::Fresh` breaking change (Stage B).** `Fresh` went from a unit variant
+to `Fresh { session_id_hint: Option<String> }` so a caller can pre-assign a native
+session id before a fresh interactive tab spawns, mirroring the existing headless
+pre-assigned-ID pattern (ADR-0002). Touched: `src/adapters/mod.rs` (the enum
+definition) plus the three adapter files that match on it — `src/adapters/
+claude_code.rs` (the only one that acts on the hint, via `--session-id <hint>`),
+`src/adapters/antigravity.rs`, and `src/adapters/codex.rs` (both just widen the match
+arm and ignore the hint — neither tool has a documented pre-assign flag).
+
+**`PaneHost` trait additions (Stage A2/C).** `with_screen`, `kill`, and
+`exit_success` were added to `src/pty/mod.rs`'s `PaneHost` trait: `with_screen`
+finalizes the render-surface seam (locks the pane's `vt100::Screen` only for the
+duration of a closure, so no lock-guard type leaks across the trait boundary — needed
+because a background reader thread mutates the parser); `kill` backs tab-close
+(prefix `x`); `exit_success` distinguishes "still running" from "exited, need the
+reason" for the `Completed`/`Failed` registry-status decision on close.
+
+**Deviation: no `event-stream` cargo feature.** `src/app/mod.rs`'s event loop needs
+async keyboard input alongside PTY-output and render-tick events. Crossterm's async
+`EventStream` requires enabling the `event-stream` cargo feature, which pulls in an
+unreviewed transitive dependency; instead the event loop spawns a dedicated blocking
+thread looping on `crossterm::event::read()` that forwards into a
+`tokio::sync::mpsc::unbounded_channel`, merged via `tokio::select!` alongside the
+pane-changed channel and a 33ms render tick. Same practical effect, zero `Cargo.toml`
+change.
+
+**Reconciliation fixture provenance (Stage D).**
+`tests/fixtures/claude_agents_all.synthetic.json` is synthetic, not real transcript
+content. The real `claude agents --json --all` *shape* was observed structurally on
+this machine (2026-07-15, `claude` 2.1.210): a bare top-level JSON array, entries
+keyed `sessionId` (camelCase — not `id`/`session_id`), and no `status` field at all.
+That observation is recorded as a dated addendum in `docs/integrations/
+claude-code.md` (field names only — no session content, per AGENTS.md). Both the
+fixture and `src/app/reconcile.rs`'s parser (which accepts all three id-key
+spellings and defaults `status` to `"unknown"`) were committed only after the repo
+owner's explicit go-ahead in chat, per AGENTS.md's rule against committing anything
+derived from a real session transcript without that sign-off.
+
+**CI.** `.github/workflows/ci.yml` added: checkout, `dtolnay/rust-toolchain@stable`
+(with `rustfmt`/`clippy` components), `Swatinem/rust-cache@v2`, then `cargo fmt
+--check`, `cargo clippy --all-targets -- -D warnings`, `cargo check`, `cargo test` on
+`ubuntu-latest`. No extra apt step needed — `rusqlite`'s `bundled` feature compiles
+SQLite from C source and `ubuntu-latest` ships `build-essential`; no test shells out
+to a wrapped CLI (PTY tests use plain `sh`, reconciliation tests read the fixture
+above), so nothing here is CI-environment-fragile.
+
+**Codex bonus verification: skipped this session.** Codex CLI is still not installed
+on this machine (`command -v codex` fails) — the codex-verification pass from the
+Stage E brief (re-run `scripts/verify-clis.sh`, settle the `docs/integrations/
+codex.md` ⬜ items, re-run the fidelity spike) stays deferred until the owner
+installs it, unchanged from the 2026-07-05 entry above.

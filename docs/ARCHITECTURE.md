@@ -27,6 +27,15 @@ between headless dispatch and interactive attention without losing the thread.
 | Registry | `src/store/` | SQLite: swarm-tui session ↔ native session ID + metadata | schema only |
 | Capability probe | `src/adapters/mod.rs` | startup `--version`/`--help` checks → `AdapterCaps` | yes |
 
+## Implementation status
+
+As of this milestone (Stages A1–E, 2026-07-15): the registry (`src/store/`), the
+PTY layer (`src/pty/`), the app shell (`src/app/`), and Claude Code reconciliation
+(`src/app/reconcile.rs`) are real and implemented — `cargo run` boots a working
+terminal shell with tabs, a home roster, and live PTY sessions. `CliAdapter::
+dispatch()`/`follow_up()` (headless dispatch), broadcast, pipelines, and MCP
+integration are still not implemented — deferred to a later milestone.
+
 ## The two channels (ADR-0001)
 
 Every adapter exposes up to two channels; the interactive one is mandatory, the
@@ -109,6 +118,9 @@ fourth adapter "a spawn command plus a probe" (ADR-0006).
 - **Two tabs on one native session** → registry enforces one live handle per native ID;
   a second open offers fork instead (`--fork-session` / `codex fork` — the latter is
   TUI-only, which is fine, since promotion is interactive by definition; agy `/fork`).
+  **Not implemented yet in this milestone** — the fork-offer described here doesn't
+  exist; nothing currently prevents two tabs from pointing at the same `native_id`;
+  deferred.
 - **Credential exposure** → adapters are forbidden (AGENTS.md boundary + code review
   rule) from opening credential files; the probe checks path existence only.
 
