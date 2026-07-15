@@ -50,7 +50,7 @@ impl CliAdapter for Codex {
     fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
         match intent {
-            LaunchIntent::Fresh => {}
+            LaunchIntent::Fresh { .. } => {}
             LaunchIntent::Resume { native_id } => {
                 cmd.arg("resume").arg(native_id);
             }

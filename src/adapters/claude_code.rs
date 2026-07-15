@@ -56,7 +56,11 @@ impl CliAdapter for ClaudeCode {
     fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
         match intent {
-            LaunchIntent::Fresh => {}
+            LaunchIntent::Fresh { session_id_hint } => {
+                if let Some(hint) = session_id_hint {
+                    cmd.arg("--session-id").arg(hint);
+                }
+            }
             // Gotcha: `--resume <id>` lookup is scoped to cwd (+ worktrees) —
             // the registry's stored cwd is what makes this reliable.
             LaunchIntent::Resume { native_id } => {

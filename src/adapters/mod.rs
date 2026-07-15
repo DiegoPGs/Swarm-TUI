@@ -55,8 +55,15 @@ pub enum ResumeSupport {
 
 /// Why a tab/PTY is being opened. Produced by the Home view & tab manager.
 pub enum LaunchIntent {
-    Fresh,
-    Resume { native_id: String },
+    /// `session_id_hint` lets the registry pre-assign a native id before the
+    /// process starts (ADR-0002); only Claude Code's `--session-id` acts on
+    /// it today, the other adapters ignore it.
+    Fresh {
+        session_id_hint: Option<String>,
+    },
+    Resume {
+        native_id: String,
+    },
     ContinueMostRecent,
 }
 

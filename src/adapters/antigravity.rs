@@ -54,7 +54,7 @@ impl CliAdapter for Antigravity {
     fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
         match intent {
-            LaunchIntent::Fresh => {}
+            LaunchIntent::Fresh { .. } => {}
             LaunchIntent::Resume { native_id } => {
                 cmd.arg("--conversation").arg(native_id);
             }
