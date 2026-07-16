@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "roles": {
+    "researcher": {
+      "tool": "antigravity",
+      "model": "gemini-3.1-pro",
+      "purpose": "web search & docs"
+    },
+    "coder": {
+      "tool": "claude-code",
+      "model": "opus-4.8",
+      "effort": "high",
+      "purpose": "implementation"
+    },
+    "advisor": {
+      "tool": "claude-code",
+      "model": "sonnet-5",
+      "purpose": "general advisor",
+      "startup_commands": ["/advisor fable"]
+    }
+  }
+}

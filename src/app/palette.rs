@@ -77,6 +77,14 @@ pub fn injection_bytes(cmd: &NativeCommand, args: Option<&str>) -> Vec<u8> {
     out
 }
 
+/// Command text as bytes, **without** the carriage return — for the two-step
+/// startup/probe injections (ADR-0010/0011: type, verify the echo, only then
+/// send Enter). The `\r` those paths eventually send is the same byte
+/// `injection_bytes` appends.
+pub fn raw_command_bytes(text: &str) -> Vec<u8> {
+    text.as_bytes().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +139,11 @@ mod tests {
             injection_bytes(&TABLE[0], Some("opus")),
             b"/model opus\r".to_vec()
         );
+    }
+
+    #[test]
+    fn raw_command_bytes_are_text_only() {
+        assert_eq!(raw_command_bytes("/advisor fable"), b"/advisor fable");
     }
 
     /// End-to-end injection against a fake pane (`sh -c cat` — no wrapped CLI

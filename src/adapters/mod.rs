@@ -206,6 +206,20 @@ pub fn registry() -> &'static [AdapterKind] {
     &[AdapterKind::ClaudeCode, AdapterKind::Antigravity]
 }
 
+/// Every **compiled** adapter, suspended ones included. Exists so callers can
+/// tell "suspended tool" (in here, not in `registry()`) apart from "unknown
+/// tool" without naming any slug themselves — the swarm-plan loader's error
+/// wording depends on it (ADR-0010). Reinstating codex (ADR-0008) touches
+/// `registry()` only; this list already carries every variant and the
+/// `all_kinds_lists_every_compiled_adapter` test keeps it honest.
+pub fn all_kinds() -> &'static [AdapterKind] {
+    &[
+        AdapterKind::ClaudeCode,
+        AdapterKind::Antigravity,
+        AdapterKind::Codex,
+    ]
+}
+
 impl AdapterKind {
     pub fn from_slug(slug: &str) -> Option<AdapterKind> {
         match slug {
@@ -327,6 +341,25 @@ mod tests {
         // Reversal path (ADR-0008): the slug stays resolvable so historical
         // registry rows keep mapping to the compiled-but-suspended adapter.
         assert_eq!(AdapterKind::from_slug("codex"), Some(AdapterKind::Codex));
+    }
+
+    /// `all_kinds()` must list every compiled variant — the swarm-plan
+    /// loader's suspended-vs-unknown distinction rides on it (ADR-0010), and
+    /// a reinstated/added adapter that forgets this list would silently load
+    /// as "unknown tool".
+    #[test]
+    fn all_kinds_lists_every_compiled_adapter() {
+        assert_eq!(
+            all_kinds(),
+            &[
+                AdapterKind::ClaudeCode,
+                AdapterKind::Antigravity,
+                AdapterKind::Codex,
+            ]
+        );
+        for kind in all_kinds() {
+            assert_eq!(AdapterKind::from_slug(kind.id()), Some(*kind));
+        }
     }
 
     fn all_tables() -> Vec<(&'static str, &'static [NativeCommand])> {

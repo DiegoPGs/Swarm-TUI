@@ -33,6 +33,10 @@ pub struct SessionRecord {
     /// v2). `None` for sessions predating v2 or launched with tool defaults.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Swarm-plan role the session was launched from (ADR-0010, registry
+    /// schema v3). Provenance of the launch preset, not enforcement — `None`
+    /// for raw-tool launches and rows predating v3.
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

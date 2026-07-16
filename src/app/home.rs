@@ -132,7 +132,7 @@ fn format_age(updated_at: SystemTime) -> String {
 /// `pane_of_session`/`Tabs` state) so this function never needs those types.
 pub fn render_home(frame: &mut Frame, area: Rect, home: &HomeView, detached: &HashSet<SessionId>) {
     let header = Row::new(vec![
-        "Tool", "Name", "Status", "Model", "Effort", "Cwd", "Age",
+        "Tool", "Name", "Role", "Status", "Model", "Effort", "Cwd", "Age",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -153,6 +153,7 @@ pub fn render_home(frame: &mut Frame, area: Rect, home: &HomeView, detached: &Ha
                 Row::new(vec![
                     Cell::from(record.tool.clone()),
                     Cell::from(name),
+                    Cell::from(record.role.clone().unwrap_or_else(|| "-".to_string())),
                     Cell::from(status),
                     Cell::from(record.model.clone().unwrap_or_else(|| "-".to_string())),
                     Cell::from(record.effort.clone().unwrap_or_else(|| "-".to_string())),
@@ -168,6 +169,7 @@ pub fn render_home(frame: &mut Frame, area: Rect, home: &HomeView, detached: &Ha
             } => Row::new(vec![
                 Cell::from(*tool),
                 Cell::from(name.clone().unwrap_or_else(|| native_id.clone())),
+                Cell::from("-"),
                 Cell::from(status_hint.clone()),
                 Cell::from("-"),
                 Cell::from("-"),
@@ -179,10 +181,13 @@ pub fn render_home(frame: &mut Frame, area: Rect, home: &HomeView, detached: &Ha
 
     let empty = rows.is_empty();
     // Status stays 18 wide: "Running [detached]" is exactly 18 chars and the
-    // badge must never truncate (the smoke harness keys on it too).
+    // badge must never truncate (the smoke harness keys on it too). Tool/Name
+    // gave up a few columns to the Role column (both tool slugs are 11 chars;
+    // the dogfood role names top out at 10).
     let widths = [
-        ratatui::layout::Constraint::Length(12),
-        ratatui::layout::Constraint::Length(16),
+        ratatui::layout::Constraint::Length(11),
+        ratatui::layout::Constraint::Length(14),
+        ratatui::layout::Constraint::Length(10),
         ratatui::layout::Constraint::Length(18),
         ratatui::layout::Constraint::Length(10),
         ratatui::layout::Constraint::Length(6),
