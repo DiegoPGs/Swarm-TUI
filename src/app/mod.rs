@@ -1676,13 +1676,20 @@ mod tests {
     /// An `App` with one registered session backed by a fake `sh -c cat`
     /// pane. Session id 1; the session tab is NOT promoted (tests do that).
     fn app_with_cat_pane(tool: &str) -> (App, tempfile::TempDir) {
+        app_with_pane(tool, "cat")
+    }
+
+    /// Like `app_with_cat_pane`, but with a chosen `sh -c` script — startup
+    /// tests need a pane that paints something before echoing (`echo ready;
+    /// cat`), since the queue waits for a stable non-blank paint.
+    fn app_with_pane(tool: &str, script: &str) -> (App, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let registry = Registry::open(&tmp.path().join("registry.db")).expect("open registry");
         // Dropping the change-notification receiver is fine: reader threads
         // send best-effort (`let _ =`) and nothing here polls redraws.
         let (mut pane_host, _pane_changed_rx) = LocalPaneHost::new();
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg("cat");
+        cmd.arg("-c").arg(script);
         let pane_id = pane_host
             .spawn(cmd, PaneSize { rows: 24, cols: 80 })
             .expect("spawn fake pane");
@@ -1788,5 +1795,124 @@ mod tests {
             seen.contains("/status"),
             "injected command never reached the pane; screen:\n{seen}"
         );
+    }
+
+    // -- roles wiring (ADR-0010; fake panes only — no wrapped CLI) -----------
+
+    #[test]
+    fn role_startup_commands_flags_persists_entries() {
+        let role = Role {
+            tool: "claude-code".to_string(),
+            model: None,
+            effort: None,
+            purpose: None,
+            startup_commands: vec![
+                "/model opus".to_string(),     // in the table, persists → confirm
+                "/status".to_string(),         // in the table, transient
+                "/advisor fable".to_string(),  // in the table, transient
+                "/not-a-real-cmd".to_string(), // absent from the table
+            ],
+        };
+        let flags: Vec<bool> = role_startup_commands(AdapterKind::ClaudeCode, &role)
+            .iter()
+            .map(|c| c.needs_confirm)
+            .collect();
+        assert_eq!(flags, vec![true, false, false, false]);
+    }
+
+    #[test]
+    fn enter_on_role_with_failed_probe_is_a_noop() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // A plan with one role, but an empty probe cache — the role renders
+        // greyed and Enter must neither spawn nor close the picker.
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "advisor".to_string(),
+            Role {
+                tool: "claude-code".to_string(),
+                model: Some("sonnet-5".to_string()),
+                effort: None,
+                purpose: None,
+                startup_commands: vec!["/advisor fable".to_string()],
+            },
+        );
+        app.plan = Some(SwarmPlan { roles });
+        app.new_session_picker = Some(PickerState::ChooseTool { selected: 0 });
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(
+                app.new_session_picker,
+                Some(PickerState::ChooseTool { selected: 0 })
+            ),
+            "picker must stay open on the greyed role"
+        );
+        assert!(
+            app.registry.all().expect("registry").is_empty(),
+            "nothing may be registered from a no-op Enter"
+        );
+    }
+
+    /// The full modal wiring: drive_background raises the persists confirm,
+    /// `n` through the real key path skips that entry, and the queue then
+    /// continues with the next command into the fake pane.
+    #[tokio::test]
+    async fn startup_confirm_flows_through_the_app_modal() {
+        let (mut app, _tmp) = app_with_pane("claude-code", "echo ready; cat");
+        let pane_id = app.pane_of_session[&1];
+        app.startup.seed(
+            1,
+            pane_id,
+            "coder".to_string(),
+            vec![
+                StartupCommand {
+                    text: "/model opus".to_string(),
+                    needs_confirm: true,
+                },
+                StartupCommand {
+                    text: "/plain after".to_string(),
+                    needs_confirm: false,
+                },
+            ],
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.pending_confirm.is_none() && Instant::now() < deadline {
+            app.drive_background();
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+        assert_eq!(
+            app.pending_confirm,
+            Some(ConfirmAction::StartupInjection { session_id: 1 })
+        );
+
+        // Decline via the real key path — skips the entry, queue continues.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .await;
+        assert!(app.pending_confirm.is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            app.drive_background();
+            seen = app
+                .pane_host
+                .with_screen(pane_id, |s| s.contents())
+                .expect("screen");
+            if seen.contains("/plain after") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+        assert!(
+            seen.contains("/plain after"),
+            "queue never continued past the declined entry; screen:\n{seen}"
+        );
+        assert!(
+            !seen.contains("/model opus"),
+            "declined command was injected anyway; screen:\n{seen}"
+        );
+        assert!(app.startup.failed_sessions().is_empty());
     }
 }
