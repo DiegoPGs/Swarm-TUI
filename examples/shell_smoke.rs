@@ -174,6 +174,24 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     d.wait_for("home paints", "Home — roster", Duration::from_secs(10))?;
     d.snapshot("1-home");
 
+    // 1b. Resources view (ADR-0011): prefix+u toggles it, bare `u` exits.
+    // No digit is EVER pressed here — a refresh would inject into a real
+    // CLI; the live probe path is the owner's smoke, not this harness's.
+    d.send(PREFIX)?;
+    d.send(b"u")?;
+    d.wait_for(
+        "resources view opens",
+        "Resources —",
+        Duration::from_secs(5),
+    )?;
+    d.snapshot("1b-resources");
+    d.send(b"u")?;
+    d.wait_for(
+        "resources view closes",
+        "Home — roster",
+        Duration::from_secs(5),
+    )?;
+
     // 2. Prefix + c opens the new-session picker. The harness cwd is the
     // repo root, so the committed `.swarm/swarm.json` lists THREE roles
     // above the tools (ADR-0010) — selecting a role would inject startup

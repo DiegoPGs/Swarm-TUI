@@ -19,6 +19,7 @@ pub mod reconcile;
 pub mod session_view;
 pub mod startup;
 pub mod tabs;
+pub mod usage;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
@@ -315,6 +316,15 @@ pub struct App {
     pub plan_error: Option<String>,
     /// In-flight role startup-command injections (ADR-0010).
     pub startup: StartupQueue,
+    /// Resources view toggle (prefix+`u`, ADR-0011): renders instead of the
+    /// roster in the Home tab's body.
+    pub show_resources: bool,
+    pub resources_scroll: usize,
+    /// Per-vendor last usage capture (ADR-0011).
+    pub usage: HashMap<AdapterKind, usage::UsageCapture>,
+    /// In-flight hidden usage probes — at most one per vendor; refresh keys
+    /// no-op while one runs.
+    pub probes: HashMap<AdapterKind, usage::ProbePane>,
     /// Size newly spawned/live panes are kept at: terminal area minus the
     /// tab bar row. Recomputed every `draw()` call so it tracks real resizes
     /// without needing a dedicated `Event::Resize` handler.
@@ -422,6 +432,10 @@ impl App {
                 plan,
                 plan_error,
                 startup: StartupQueue::default(),
+                show_resources: false,
+                resources_scroll: 0,
+                usage: HashMap::new(),
+                probes: HashMap::new(),
                 pane_area_size,
             },
             pane_changed_rx,
@@ -683,6 +697,26 @@ impl App {
     }
 
     fn handle_home_key(&mut self, key: KeyEvent) {
+        // Resources view (ADR-0011) takes over Home-local keys while shown.
+        if self.show_resources {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('u') => self.show_resources = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.resources_scroll = self.resources_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.resources_scroll = self.resources_scroll.saturating_add(1);
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    let idx = (c as usize - '0' as usize) - 1;
+                    if let Some(&kind) = adapters::registry().get(idx) {
+                        self.refresh_usage(kind);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.home.select_prev(),
             KeyCode::Down | KeyCode::Char('j') => self.home.select_next(),
@@ -694,6 +728,43 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// User-initiated usage refresh (ADR-0011): spawn the hidden probe pane
+    /// for `kind` unless one is already in flight or the vendor declares no
+    /// usage command. The pane goes into `probes` only — never into
+    /// `pane_of_session`, tabs, or the registry.
+    fn refresh_usage(&mut self, kind: AdapterKind) {
+        if self.probes.contains_key(&kind) {
+            return;
+        }
+        if !matches!(self.probe_cache.get(&kind), Some(Ok(_))) {
+            return; // not installed — no block to refresh
+        }
+        let Some(inject) = usage::probe_command_for(kind) else {
+            return;
+        };
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        let cmd = kind.interactive_cmd(
+            &adapters::LaunchIntent::Fresh {
+                session_id_hint: None,
+            },
+            &adapters::LaunchOptions::default(),
+            &cwd,
+        );
+        match usage::ProbePane::spawn(&mut self.pane_host, cmd, inject) {
+            Ok(probe) => {
+                self.probes.insert(kind, probe);
+            }
+            Err(e) => {
+                self.usage.insert(
+                    kind,
+                    usage::UsageCapture::failure(format!("probe spawn failed: {e:?}")),
+                );
+            }
         }
     }
 
@@ -753,11 +824,19 @@ impl App {
                 self.plan = plan;
                 self.plan_error = plan_error;
             }
+            KeyCode::Char('u') => {
+                // Resources view (ADR-0011) lives in the Home tab's body.
+                self.tabs.active = 0;
+                self.show_resources = !self.show_resources;
+            }
             KeyCode::Char('?') => {
                 self.show_keymap_overlay = !self.show_keymap_overlay;
             }
             KeyCode::Char('q') => {
                 if self.pane_of_session.is_empty() {
+                    // Session panes are gone; make sure no hidden probe pane
+                    // outlives the app either (ADR-0011).
+                    self.kill_probe_panes();
                     quit_now = true;
                 } else {
                     self.pending_confirm = Some(ConfirmAction::Quit);
@@ -766,6 +845,12 @@ impl App {
             _ => {}
         }
         quit_now
+    }
+
+    fn kill_probe_panes(&mut self) {
+        for (_, probe) in self.probes.drain() {
+            let _ = self.pane_host.kill(probe.pane_id());
+        }
     }
 
     /// Open the command palette (prefix `:`, ADR-0009) — session tabs only,
@@ -898,21 +983,23 @@ impl App {
             ConfirmAction::Quit => {
                 // Fire-and-forget: a bulk quit-kill doesn't update registry
                 // status (out of scope for a clean-shutdown path) — just
-                // make sure nothing is left running.
+                // make sure nothing is left running, hidden probe panes
+                // included (ADR-0011).
                 for &pane_id in self.pane_of_session.values() {
                     let _ = self.pane_host.kill(pane_id);
                 }
+                self.kill_probe_panes();
                 true
             }
         }
     }
 
-    /// Advance the background state machines (role startup injections now;
-    /// usage probes join in stage 4). Called from the event-loop tick — the
-    /// machines rate-limit themselves, so every-33ms is fine. Returns true
-    /// when anything changed (the caller marks the frame dirty). Also raises
-    /// the persists-confirm modal when a queue wants one and the confirm
-    /// slot is free.
+    /// Advance the background state machines (role startup injections,
+    /// ADR-0010; hidden usage probes, ADR-0011). Called from the event-loop
+    /// tick — the machines rate-limit themselves, so every-33ms is fine.
+    /// Returns true when anything changed (the caller marks the frame
+    /// dirty). Also raises the persists-confirm modal when a queue wants one
+    /// and the confirm slot is free.
     fn drive_background(&mut self) -> bool {
         let mut changed = self.startup.drive(&mut self.pane_host);
         if self.pending_confirm.is_none() {
@@ -920,6 +1007,27 @@ impl App {
                 self.pending_confirm = Some(ConfirmAction::StartupInjection { session_id });
                 changed = true;
             }
+        }
+
+        // Usage probes: capture-or-abort ends with the pane killed and the
+        // probe dropped; the result lands in the per-vendor usage slot.
+        let mut done: Vec<(AdapterKind, usage::UsageCapture)> = Vec::new();
+        for (kind, probe) in self.probes.iter_mut() {
+            match probe.drive(&mut self.pane_host) {
+                usage::ProbeStep::Idle => {}
+                usage::ProbeStep::Changed => changed = true,
+                usage::ProbeStep::Finished(capture) => done.push((*kind, capture)),
+                usage::ProbeStep::Aborted(msg) => {
+                    done.push((*kind, usage::UsageCapture::failure(msg)));
+                }
+            }
+        }
+        for (kind, capture) in done {
+            if let Some(probe) = self.probes.remove(&kind) {
+                let _ = self.pane_host.kill(probe.pane_id());
+            }
+            self.usage.insert(kind, capture);
+            changed = true;
         }
         changed
     }
@@ -1116,8 +1224,19 @@ impl App {
                 }
             }
             _ => {
-                let detached = self.detached_set();
-                home::render_home(frame, body_area, &self.home, &detached);
+                if self.show_resources {
+                    usage::render_resources(
+                        frame,
+                        body_area,
+                        self.plan.as_ref(),
+                        &self.usage,
+                        &self.probes,
+                        self.resources_scroll,
+                    );
+                } else {
+                    let detached = self.detached_set();
+                    home::render_home(frame, body_area, &self.home, &detached);
+                }
             }
         }
 
@@ -1146,7 +1265,7 @@ impl App {
             };
             frame.render_widget(
                 Paragraph::new(
-                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  : palette  d detach  x close  r refresh  ? help  q quit",
+                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  : palette  d detach  x close  r refresh  u usage  ? help  q quit",
                 )
                 .style(Style::default().add_modifier(Modifier::REVERSED)),
                 banner_area,
@@ -1175,7 +1294,8 @@ impl App {
             Line::from("  :       Command palette (session tab)"),
             Line::from("  d       Detach"),
             Line::from("  x       Close tab (confirm)"),
-            Line::from("  r       Refresh roster"),
+            Line::from("  r       Refresh roster + swarm plan"),
+            Line::from("  u       Resources view (usage per vendor)"),
             Line::from("  ?       Toggle this overlay"),
             Line::from("  q       Quit (confirm if any pane alive)"),
             Line::from(""),
@@ -1583,6 +1703,10 @@ mod tests {
             plan: None,
             plan_error: None,
             startup: StartupQueue::default(),
+            show_resources: false,
+            resources_scroll: 0,
+            usage: HashMap::new(),
+            probes: HashMap::new(),
             pane_area_size: PaneSize { rows: 24, cols: 80 },
         };
         (app, tmp)

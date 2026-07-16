@@ -107,7 +107,7 @@ pub fn is_detached(
         .any(|t| matches!(t, Tab::Session { session_id: sid } if *sid == session_id))
 }
 
-fn format_age(updated_at: SystemTime) -> String {
+pub(crate) fn format_age(updated_at: SystemTime) -> String {
     let secs = SystemTime::now()
         .duration_since(updated_at)
         .map(|d| d.as_secs())
