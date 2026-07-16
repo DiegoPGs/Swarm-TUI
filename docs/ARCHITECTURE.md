@@ -19,7 +19,7 @@ thread.
 
 | Component | Module | Responsibility | Knows about CLIs? |
 | --- | --- | --- | --- |
-| TUI shell | `src/app/` | tab bar, keymap, layout, rendering loop | no |
+| TUI shell | `src/app/` | tab bar, keymap, command palette, layout, rendering loop | no |
 | Home view | `src/app/home.rs` | roster, task input, dispatch/broadcast UI, event timeline | no |
 | Session view | `src/app/session_view.rs` | renders one PTY grid, forwards keystrokes | no |
 | Task router | `src/core/task.rs` | maps a home-view task to target adapter(s) + guardrails | capability level only |
@@ -28,6 +28,26 @@ thread.
 | PTY host | `src/pty/` | spawn/resize/kill PTY children, vt100 grid state (`tui-term`) | no |
 | Registry | `src/store/` | SQLite: swarm-tui session ↔ native session ID + metadata | schema only |
 | Capability probe | `src/adapters/mod.rs` | startup `--version`/`--help` checks → `AdapterCaps` | yes |
+
+## The command plane (ADR-0007, ADR-0009)
+
+Input routing reserves exactly one key: **Ctrl-Space**, the one-shot prefix
+(ADR-0007). Everything else flows to the focused surface — the wrapped TUI on a
+session tab, row navigation on Home. On top of that sit three layers (ADR-0009):
+
+- **Layer 0 — native passthrough.** Slash commands typed inside a pane go straight
+  to the tool; swarm-tui never intercepts or parses them.
+- **Layer 1 — command palette.** Prefix + `:` on a session tab lists that tool's
+  locally-verified native commands (`CliAdapter::command_table()`, populated from
+  `docs/integrations/command-surfaces.md`) and injects the selection — command text
+  plus carriage return — through the same write path as ordinary keystrokes; the
+  tool's own UI takes over. Entries with cross-session effects carry a `[persists]`
+  badge; entries declaring an args hint offer a free-text argument line first.
+- **Layer 2 — launch options.** The new-session picker renders a per-tool options
+  form (model / effort) declared by `AdapterCaps.launch` — probe-gated on the
+  installed binary's `--help`, so upstream flag drift hides a field instead of
+  breaking a spawn. Choices persist on the session row (registry schema v2) and
+  show in the roster and the session status line.
 
 ## Implementation status
 
@@ -44,6 +64,11 @@ it, so it is never probed, offered in the new-session picker, or spawned. Histor
 `tool = "codex"` registry rows render read-only in the roster. Codex mentions
 elsewhere on this page (channel tables, guardrail defaults, failure modes) remain as
 recorded design for the reversal path.
+
+**Milestone 2b (the command plane) is implemented as of 2026-07-16:** the command
+palette, per-tool launch options, and registry schema v2 (`model`/`effort` columns
+with a real v1→v2 migration) are live — see "The command plane" above and
+ADR-0009.
 
 ## The two channels (ADR-0001)
 

@@ -19,11 +19,16 @@ workspace:
 
 ## Status
 
-**Milestone 2a (the shell) is implemented as of 2026-07-15.** `cargo run` boots a
-real, interactive terminal shell — tabs, a home roster, and live PTY sessions for
-Claude Code and Antigravity CLI (an active tool degrades to a greyed-out badge if
-its probe fails, never disappears), plus Claude Code background-agent
-reconciliation. **Codex CLI is suspended as of 2026-07-16**
+**Milestone 2b (the command plane) is implemented as of 2026-07-16**, on top of
+the 2a shell (2026-07-15). `cargo run` boots a real, interactive terminal shell —
+tabs, a home roster, and live PTY sessions for Claude Code and Antigravity CLI
+(an active tool degrades to a greyed-out badge if its probe fails, never
+disappears), plus Claude Code background-agent reconciliation. New in 2b: a
+**command palette** (`Ctrl-Space` then `:` on a session tab) that injects each
+tool's verified native slash commands, and **launch options** — pick model (and
+effort, for claude) when spawning a session; the choice is stored on the session
+row and shown in the roster. Per-tool command facts live in
+[`docs/integrations/command-surfaces.md`](docs/integrations/command-surfaces.md). **Codex CLI is suspended as of 2026-07-16**
 ([ADR-0008](docs/adr/0008-suspend-codex-integration.md)): its adapter stays
 compiled for easy reversal, but it is never probed, offered, or spawned; historical
 codex rows still render read-only in the roster. Headless dispatch
@@ -57,7 +62,8 @@ Press **Ctrl-Space** to enter the one-shot command mode, then press one of:
 | `h` / `0` | Home |
 | `1`-`9` | Jump to tab N |
 | `n` / `p` | Cycle to next / previous tab |
-| `c` | New session |
+| `c` | New session (tool, then model/effort options) |
+| `:` | Command palette — inject a native slash command into the active session tab |
 | `d` | Detach |
 | `x` | Close tab (confirm) |
 | `r` | Refresh roster |

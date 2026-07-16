@@ -288,3 +288,55 @@ change: two trusted-workspace entries (repo root — intended; `target/slash-pro
 **Fidelity-spike follow-up:** with the repo now trusted, agy boots to its prompt,
 so the spike's "echo of typed chars" check passes again at 1.1.3 (the stage-0
 DEFECT line was the trust dialog swallowing chars, as recorded above).
+
+## Milestone 2b complete — two worlds, one command plane (2026-07-16)
+
+Everything shipped on branch `feat/milestone-2b-command-plane` (PR for owner
+review, not merged). Stage map: 0 validation → 1 ADR-0008 codex suspension →
+2 command-surface research → 3 ADR-0009 + the two `CliAdapter` changes →
+4 launch options + palette → 5 tests → 6 this docs pass.
+
+**The two adapter-boundary changes (owner-authorized in the milestone plan,
+recorded in ADR-0009):** `interactive_cmd(intent, opts: &LaunchOptions, cwd)`
+(claude maps `--model`/`--effort`, agy `--model` only, codex ignores both) and
+`command_table() -> &'static [NativeCommand]` (default `&[]`; claude 21 entries,
+agy 19, codex 0 — populated strictly from ✅-local rows in
+`command-surfaces.md`). Launch-option declaration rides on `AdapterCaps.launch`,
+probe-gated on `--help` — no third trait method.
+
+**Registry schema v2.** `sessions` gains `model TEXT, effort TEXT`; `open()` now
+actually reads `schema_version` (it never did in v1): fresh DBs are created at v2,
+v1 DBs migrate in one transaction (additive ALTERs), anything newer than v2
+refuses to open. Migration is covered by tests building a verbatim-v1 database.
+Suggested once before the first post-merge run:
+`cp "$XDG_DATA_HOME/swarm-tui/registry.db" "$XDG_DATA_HOME/swarm-tui/registry.db.bak"`
+(defensive only; the migration is additive).
+
+**Fixed along the way (pre-existing, surfaced by this milestone's gates):**
+
+- `src/pty/local.rs` exit-status race: PTY EOF can precede the kernel exposing
+  the child's exit status; the single non-blocking `try_wait()` misreported
+  clean exits as failures (~50% flake on `exit_detection_reports_success_and_
+  failure` under parallel test load). Now polls briefly on EOF, lock released
+  between polls. Six consecutive full-suite runs green after the fix.
+- Home roster Status column: the new Model/Effort columns initially squeezed
+  Status below 18 chars, truncating the `[detached]` badge — caught by the
+  `shell_smoke` harness, width restored (the badge string is exactly 18 chars).
+
+**Deviations / disclosures (also in the stage entries above):** the 2a smoke
+checklist was never recorded in NOTES, so stage 0 authored it from the
+milestone-2b brief; the agy trust accept misfired once into `target/slash-probe`
+before landing on the repo root (stage 2 entry — harnesses now anchor on
+`CARGO_MANIFEST_DIR`); claude's `/agents` is a "(removed)" stub at 2.1.211 and is
+deliberately excluded from the palette table; `/cost` is folded into `/usage` as
+an alias. Nothing observed this milestone contradicts an accepted ADR — ADR-0007
+was amended (not superseded) with the `:` row per the owner's instruction,
+recorded in ADR-0009.
+
+**Still open ⬜ after 2b** (see `command-surfaces.md` + `antigravity.md`):
+agy `--model` accepted argument format (supervised one-liner recorded); agy
+`/model` persistence mechanism (🔶 sticky-default evidence); whether agy
+`/schedule` timers outlive the session; claude `/effort max`/`ultracode`
+persistence nuance (owner-reported 🔶 vs. undistinguishing official docs); the
+three pre-existing agy live-dispatch items; everything codex (suspended,
+ADR-0008).
