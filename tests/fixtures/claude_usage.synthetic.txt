@@ -1,0 +1,40 @@
+
+ ▐▛███▜▌   Claude Code v2.1.211
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $1.2345
+   Total duration (API):  4m 56s
+   Total duration (wall): 12m 3s
+   Total code changes:    123 lines added, 45 lines removed
+   Usage:                 12345 input, 6789 output, 111213 cache read, 1415 cache write
+
+   Current session
+   ██████▌                                            13% used
+   Resets 6:00pm (America/Anchorage)
+
+   Current week (all models)
+   █████████████▌                                     27% used
+   Resets Jul 21, 7am (America/Anchorage)
+
+   Current week (Fable)
+   ██████████████████████▌                            45% used
+   Resets Jul 21, 7am (America/Anchorage)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   80% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and
+    consider configuring a cheaper model for simpler subagents.
+
+   55% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear
+    when switching to new tasks.
+
+   Subagents               % of usage
+   Plan                           20%                                                                                                     ↓

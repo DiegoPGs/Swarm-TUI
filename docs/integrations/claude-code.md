@@ -90,6 +90,18 @@ slash-command surface at this version lives in `command-surfaces.md`.
 - The in-TUI slash-command surface at 2.1.211 (incl. `/model` and `/effort`
   persistence semantics) lives in [`command-surfaces.md`](command-surfaces.md).
 
+## Usage & quota visibility (milestone 2c)
+
+- ✅ *(local 2026-07-16, 2.1.211)* **No CLI-level usage surface**: `--help`
+  lists no usage/quota subcommand or flag. Usage lives only in the TUI.
+- ✅ *(local 2026-07-16)* `/usage` opens the Settings panel's Usage tab:
+  session stats plus three plan windows (*Current session*, *Current week (all
+  models)*, *Current week (Fable)*), each with a "NN% used" bar **and a reset
+  time in the account's local timezone**. Esc closes. Details + capture method:
+  [`command-surfaces.md`](command-surfaces.md) "Usage surfaces".
+- swarm-tui reads this via ADR-0011's user-initiated probe pane (verbatim
+  capture; a probe spawn creates a real — unregistered — native session).
+
 ## MCP posture
 
 - ✅ MCP client: `claude mcp` subcommands, `--mcp-config`, `--strict-mcp-config`.

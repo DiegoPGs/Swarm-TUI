@@ -102,6 +102,23 @@ this repo (recorded in NOTES.md).
   router sends agy read/analysis-shaped tasks only. *Deferred 2026-07-05: live
   dispatch, run supervised.*
 
+## Usage & quota visibility (milestone 2c)
+
+- ✅ *(local 2026-07-16, 1.1.3)* **No CLI-level usage surface**: `--help` lists
+  no quota subcommand; `agy models` prints model display names only (incidental
+  ✅: `Gemini 3.5 Flash (Medium/High/Low)`, `Gemini 3.1 Pro (Low/High)`,
+  `Claude Sonnet 4.6 (Thinking)`, `Claude Opus 4.6 (Thinking)`,
+  `GPT-OSS 120B (Medium)`). Usage lives only in the TUI.
+- ✅ *(local 2026-07-16)* `/usage` (`/quota`) opens the **Models & Quota** page:
+  per model group (Gemini; Claude and GPT), a Weekly and a Five-Hour bar with a
+  percentage of quota **available** (inverse of claude's "used" semantics — see
+  [`command-surfaces.md`](command-surfaces.md) "Usage surfaces"). No reset
+  times observed. Esc closes.
+- ✅ *(local 2026-07-16)* `/credits` shows remaining G1 AI credits (here: "not
+  enabled") + purchase/activity actions. Runtime probes send `/usage` only.
+- Probe etiquette: quota is shared with the desktop app (see Quirks), so
+  swarm-tui's usage refresh is manual-only (ADR-0011).
+
 ## MCP posture & subagents
 
 - ✅ MCP client (config files above, `/mcp` manager, configurable server-launch

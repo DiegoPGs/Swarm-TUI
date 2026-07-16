@@ -182,3 +182,64 @@ Remaining menu entries: `/add-dir`, `/artifact`, `/changelog`, `/copy`, `/exit
   official docs don't distinguish).
 - The three pre-existing antigravity.md ⬜ items (live headless dispatch) are
   unchanged — out of scope this milestone.
+
+## Usage surfaces (milestone 2c, 2026-07-16)
+
+*How each tool reports plan/quota usage, researched for ADR-0011. Method: CLI
+`--help`/subcommand greps (read-only), plus one owner-authorized capture run per
+tool via `slash_probe`'s new `usage` mode, which submitted exactly `/usage` +
+`/status` (claude) and `/usage` + `/credits` (agy) in a dedicated probe pane —
+the four commands the owner whitelisted for this milestone (recorded in
+NOTES.md). Real captures live only in gitignored `target/slash-probe/`;
+committed fixtures (`tests/fixtures/*_usage.synthetic.txt`) are hand-written
+synthetics with invented numbers/emails.*
+
+**Machine-readable surface: none on either tool** ✅ *(local 2026-07-16)*.
+`claude --help` lists no usage/quota subcommand or flag (subcommands: agents,
+auth, auto-mode, doctor, gateway, install, mcp, plugin, project, setup-token,
+ultrareview, update); per the guess-no-subcommands rule nothing unlisted was
+invoked. `agy --help` likewise (subcommands: agent(s), changelog, help, install,
+models, plugin(s), update); `agy models` lists model display names only, no
+quota data. Both tools expose usage **only inside their TUIs** → ADR-0011's
+probe-pane mechanism applies to both vendors.
+
+### Claude Code `/usage` ✅ *(local 2026-07-16, 2.1.211)*
+
+Opens the Settings panel's **Usage** tab (Esc closes). Contents: a Session
+block (cost, API/wall duration, code changes, token counts), then three plan
+windows, each a bar + **"NN% used"** + a reset line with local wall time and
+timezone name — *Current session*, *Current week (all models)*, *Current week
+(Fable)* — then a "What's contributing to your limits usage?" analysis
+(explicitly "approximate, based on local sessions on this machine"). Plan-window
+percentages and reset times: **yes, both present** ✅. `/status` (same panel,
+Status tab) shows version, session name/ID, cwd, login method, organization,
+account email, model, MCP summary — account-identifying, hence synthetic
+fixtures.
+
+### Antigravity CLI `/usage` (`/quota`) ✅ *(local 2026-07-16, 1.1.3)*
+
+Opens the **Models & Quota** page (Esc closes; replaced the legacy usage page —
+`agy changelog` ✅ *(changelog)*). Contents: account email, then two model
+groups (*GEMINI MODELS*; *CLAUDE AND GPT MODELS*), each with a **Weekly Limit**
+and a **Five Hour Limit** bar + percentage + status line ("Quota available").
+**Semantics inverted vs. claude: agy's percentage is quota *available*
+(100.00% = untouched), claude's is quota *used*** — a reason ADR-0011 renders
+captures verbatim rather than normalizing. No reset times shown. The changelog
+also notes `/usage`/`/quota` force a real-time quota reload, and quota + mode
+now appear in the status line ✅ *(changelog)*.
+
+### Antigravity CLI `/credits` ✅ *(local 2026-07-16, 1.1.3)*
+
+A small panel: "Remaining AI Credits: …" (on this machine: "AI Credits not
+enabled (enable in /settings)") plus actions (*Get More AI Credits*, *See
+Activity*). G1 credits are consumed when standard quota runs out, opt-in via a
+`UseG1Credits` setting ✅ *(changelog)*. Runtime usage probes (ADR-0011) send
+`/usage` only; `/credits` is recorded here for a future refresh extension.
+
+### Open ⬜ from this pass
+
+- claude: whether `/usage`'s plan windows cover *all* plan types (observed on
+  Claude Pro only).
+- agy: whether the Models & Quota page shows reset times when a bucket is
+  partially consumed (both buckets were at 100.00% available during capture).
+- agy: `/credits` appearance when AI Credits *are* enabled.

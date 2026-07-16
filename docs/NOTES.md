@@ -360,3 +360,37 @@ typed chars: OK"**: the repo dir is now a trusted agy workspace (the 2b
 owner-authorized trust accept), so agy boots straight to its prompt instead of
 the char-swallowing trust dialog. Same 1-line cursor artifact. No doc change
 needed; ADR-0003 stands.
+
+## Milestone 2c — Stage 1: usage-surface research (2026-07-16)
+
+**Usage-submission authorization (owner-granted 2026-07-16, in the 2c brief).**
+The brief whitelists exactly four read-only display commands for submission in a
+dedicated probe pane: `/usage` + `/status` (claude), `/usage` + `/credits`
+(agy). Executed via `slash_probe`'s new `usage` mode
+(`cargo run --example slash_probe -- <claude|agy> usage`), one run per tool,
+four submissions total — each printed to the run log at the moment of the
+Enter. Nothing else was submitted; cleanup used Esc/backspace only. Execution
+notes, full disclosure: the claude probe pane is a real interactive spawn, so
+it created one native claude session (its ID is visible in the `/status`
+capture); the pane was killed at teardown and never touched swarm-tui's
+registry. The agy probe opened in the repo dir, which has been a trusted agy
+workspace since the 2b accept — no trust dialog appeared and no agy state
+changed.
+
+**Findings** (detail in `command-surfaces.md` → "Usage surfaces"): neither tool
+has a machine-readable or CLI-level usage surface — `--help` on both lists
+nothing quota-shaped, and `agy models` prints display names only. Usage lives
+only inside the TUIs: claude `/usage` = Settings→Usage tab with three plan
+windows, **"NN% used" bars and reset times**; agy `/usage` = Models & Quota
+page, per-group Weekly/Five-Hour bars whose percentage is quota **available**
+(inverted semantics vs. claude — normalization would drift, verbatim rendering
+it is); agy `/credits` = G1 credits panel ("not enabled" on this machine).
+ADR-0011's probe-pane mechanism therefore applies to **both** vendors.
+
+**Fixtures.** Real captures live only in gitignored `target/slash-probe/`
+(they contain the account email, plan tier, timezone, and live percentages —
+account state, never committed). Committed instead:
+`tests/fixtures/claude_usage.synthetic.txt` and
+`tests/fixtures/agy_usage.synthetic.txt`, hand-written to preserve each
+screen's structure with invented numbers, timezone, and email — same synthetic
+convention as `claude_agents_all.synthetic.json` (2b).
