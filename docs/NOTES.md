@@ -199,3 +199,61 @@ on this machine (`command -v codex` fails) — the codex-verification pass from 
 Stage E brief (re-run `scripts/verify-clis.sh`, settle the `docs/integrations/
 codex.md` ⬜ items, re-run the fidelity spike) stays deferred until the owner
 installs it, unchanged from the 2026-07-05 entry above.
+
+## Milestone 2b — Stage 0: local validation (2026-07-16)
+
+**Gates: all green.** `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo check`, `cargo test` (29/29), and `cargo run --example
+fidelity_spike` all pass on the target machine. Installed versions this session:
+`claude` **2.1.211**, `agy` **1.1.3**, codex still absent.
+
+**CI: enabled and green.** The `CI` workflow has two successful runs on GitHub —
+`29387475686` (push to main, 2026-07-15, the milestone-2a merge) and `29386886662`
+(the PR run). Nothing needed enabling.
+
+**Fidelity spike re-run (claude 2.1.211 / agy 1.1.3) — ADR-0003 verdict unchanged.**
+Two report lines differ from the 2026-07-05 run, both explained and neither a
+rendering defect:
+
+- *claude, "1 differing line" (widget vs vt100)*: the diff is the **cursor cell** —
+  `tui_term::PseudoTerminal` paints `█` at the cursor position while
+  `vt100::Screen::contents()` renders no cursor glyph. Comparison artifact of the
+  spike's proxy check, not a fidelity failure (on 2026-07-05 the cursor happened to
+  sit on content the proxy trimmed).
+- *agy, "echo of typed chars: DEFECT"*: the repo dir is an untrusted agy workspace,
+  so agy boots to its workspace-trust dialog, which by design ignores character keys
+  (recorded 2026-07-05). Chars typed at that dialog don't echo. Expected state, not
+  a defect. Incidental drift observation from the dialog footer: agy 1.1.3's default
+  model indicator reads **"Gemini 3.1 Pro (High)"** (the page recorded a 3.5 Flash
+  default at v1.0.14–1.0.16) — refreshed in the Stage 2 pass.
+
+**2a smoke checklist: executed, all steps OK.** Deviation to note: the milestone-2a
+entry above recorded no smoke checklist, so the checklist executed here is the one
+from the milestone-2b brief. tmux isn't installed, so the checklist is driven by a
+new PTY harness, `examples/shell_smoke.rs` (`cargo build && cargo run --example
+shell_smoke`), which boots the real `target/debug/swarm-tui` inside `portable-pty`
+with `SWARM_TUI_DATA_DIR` pointed at a throwaway tempdir (the real registry is never
+touched) and gates every step on an on-screen vt100 marker. Enter is pressed only on
+swarm-tui's own surfaces (picker/roster/confirms); wrapped panes receive printable
+characters only. Results (2026-07-16):
+
+| Step | Result |
+| --- | --- |
+| Home paints (empty roster) | OK |
+| prefix banner (`Ctrl-Space`) → picker (`c`) | OK |
+| claude tab: paint (`--session-id <uuid>` spawn path) | OK |
+| claude tab: typed characters echo (no Enter) | OK |
+| claude tab: repaint after 120×40 → 100×30 resize | OK |
+| detach (`d`) → Home shows `[detached]` badge | OK |
+| re-attach (Enter on roster row) restores the pane | OK |
+| close (`x`, confirm) → row lands `Failed` (killed) | OK |
+| agy tab: pane paints — trust dialog renders | OK (dialog visible) |
+| close agy, quit (`q`) — clean exit 0 | OK |
+
+Incidental ✅: the claude spawn path proves `claude --session-id <uuid>` is accepted
+on an **interactive fresh spawn** at 2.1.211 — stamped in
+`docs/integrations/claude-code.md`.
+
+**Open-⬜ review (read-only pass):** `claude-code.md` had no open ⬜ items.
+`antigravity.md`'s three ⬜ items all require a live headless dispatch ("run
+supervised") and stay open by design this milestone.
