@@ -32,6 +32,33 @@ pub struct AdapterCaps {
     /// Tool ships its own background-session supervisor
     /// (Claude Code `--bg` / `claude agents`). ADR-0002 reconciles with it.
     pub background_supervisor: bool,
+    /// Which launch options the new-session picker may offer for this tool
+    /// (ADR-0009). Set by `probe()` gated on the flag actually appearing in
+    /// the installed binary's `--help`, so upstream drift degrades to "field
+    /// hidden in the picker", never a broken spawn.
+    pub launch: LaunchOptionsDecl,
+}
+
+/// Per-tool declaration of the launch options `interactive_cmd` can map
+/// (ADR-0009). `Some` means the flag exists on the installed binary; the slice
+/// carries UI suggestions — alias suggestions for the free-text model field,
+/// the fixed level list for effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchOptionsDecl {
+    pub model: Option<&'static [&'static str]>,
+    pub effort: Option<&'static [&'static str]>,
+}
+
+impl LaunchOptionsDecl {
+    pub const NONE: LaunchOptionsDecl = LaunchOptionsDecl {
+        model: None,
+        effort: None,
+    };
+
+    /// Whether the picker has anything to ask for this tool.
+    pub fn any(&self) -> bool {
+        self.model.is_some() || self.effort.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +94,37 @@ pub enum LaunchIntent {
     ContinueMostRecent,
 }
 
+/// User-chosen launch options for an interactive spawn (ADR-0009). Data only —
+/// each adapter maps the options it supports to its own flags and silently
+/// ignores the rest. Persisted on the session row (schema v2) so the roster
+/// can show what a session was launched with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// One entry in an adapter's declarative command table (ADR-0009): a native
+/// slash command the palette may inject into that tool's pane. Populated only
+/// from commands verified ✅ locally in
+/// `docs/integrations/command-surfaces.md` — an injected command executes on
+/// arrival, so a stale guess types a wrong command into a live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeCommand {
+    /// As the tool's own menu shows it, e.g. `/model`.
+    pub name: &'static str,
+    /// Exact text typed into the pane (usually == `name`; kept separate so an
+    /// autocomplete-interference workaround can alter bytes without renaming).
+    pub inject: &'static str,
+    pub description: &'static str,
+    /// When `Some`, the palette offers a free-text argument line first; the
+    /// hint describes what the tool expects after the command.
+    pub args_hint: Option<&'static str>,
+    /// The command's effect outlives the session (writes tool state/config) —
+    /// rendered as a `[persists]` badge.
+    pub persists: bool,
+}
+
 /// A running headless dispatch: normalized events plus the child to reap.
 /// TODO(next session): becomes an async stream once tokio lands (ADR-0005);
 /// the std `mpsc` shape here exists only to pin the boundary dependency-free.
@@ -95,8 +153,17 @@ pub trait CliAdapter {
     /// Must never touch config/auth files (AGENTS.md boundary).
     fn probe(&self) -> Result<AdapterCaps, AdapterError>;
 
-    /// Command that opens the tool's own TUI for a tab.
-    fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command;
+    /// Command that opens the tool's own TUI for a tab. `opts` carries the
+    /// user's launch choices (ADR-0009): map the supported ones to flags,
+    /// silently ignore the rest. Options apply to every intent — the flags
+    /// are session-scoped on resume too.
+    fn interactive_cmd(&self, intent: &LaunchIntent, opts: &LaunchOptions, cwd: &Path) -> Command;
+
+    /// This tool's palette-injectable native commands (ADR-0009). Default
+    /// empty: a minimum-viable or suspended adapter needs no override.
+    fn command_table(&self) -> &'static [NativeCommand] {
+        &[]
+    }
 
     /// Headless one-shot in `task.cwd`, translating `task.budget` into the
     /// tool's native guardrails (ARCHITECTURE guardrail table).
@@ -183,11 +250,22 @@ impl CliAdapter for AdapterKind {
         }
     }
 
-    fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
+    fn interactive_cmd(&self, intent: &LaunchIntent, opts: &LaunchOptions, cwd: &Path) -> Command {
         match self {
-            AdapterKind::ClaudeCode => claude_code::ClaudeCode.interactive_cmd(intent, cwd),
-            AdapterKind::Antigravity => antigravity::Antigravity.interactive_cmd(intent, cwd),
-            AdapterKind::Codex => codex::Codex.interactive_cmd(intent, cwd),
+            AdapterKind::ClaudeCode => claude_code::ClaudeCode.interactive_cmd(intent, opts, cwd),
+            AdapterKind::Antigravity => antigravity::Antigravity.interactive_cmd(intent, opts, cwd),
+            AdapterKind::Codex => codex::Codex.interactive_cmd(intent, opts, cwd),
+        }
+    }
+
+    // Explicit dispatch is load-bearing here: without it, enum-dispatched
+    // calls would silently hit the trait's default `&[]` and every palette
+    // would be empty (pinned by claude_and_agy_command_tables_populated).
+    fn command_table(&self) -> &'static [NativeCommand] {
+        match self {
+            AdapterKind::ClaudeCode => claude_code::ClaudeCode.command_table(),
+            AdapterKind::Antigravity => antigravity::Antigravity.command_table(),
+            AdapterKind::Codex => codex::Codex.command_table(),
         }
     }
 

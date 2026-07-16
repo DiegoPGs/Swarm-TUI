@@ -1,7 +1,9 @@
 //! Application layer: terminal setup, event loop, layout, tab switching.
 //!
 //! Knows CLIs? **Almost never.** This layer speaks `crate::core` vocabulary
-//! (sessions, tasks, `AgentEvent`) and `crate::pty::PaneHost` surfaces. The one
+//! (sessions, tasks, `AgentEvent`), `crate::pty::PaneHost` surfaces, and the
+//! data-only launch/command vocabulary from `crate::adapters` (`AdapterCaps`,
+//! `LaunchIntent`, `LaunchOptions`, `NativeCommand` — ADR-0009). The one
 //! pre-authorized exception (this stage) is matching on `adapters::AdapterKind`
 //! to decide the claude native_id-hint prepopulation in `open_new_session` —
 //! `AdapterKind` is already a shared, CLI-agnostic-safe identifier `app` uses
@@ -356,7 +358,7 @@ impl App {
         };
         // TODO(2b): prompt for cwd instead of always using the launch cwd.
         let cwd = std::env::current_dir()?;
-        let cmd = kind.interactive_cmd(&intent, &cwd);
+        let cmd = kind.interactive_cmd(&intent, &adapters::LaunchOptions::default(), &cwd);
         let pane_id = self.pane_host.spawn(cmd, self.pane_area_size)?;
 
         let id = self.registry.allocate_id()?;
