@@ -238,7 +238,7 @@ impl App {
         config: &SwarmTuiConfig,
     ) -> Result<(App, UnboundedReceiver<PaneId>), AppError> {
         let mut probe_cache = HashMap::new();
-        for kind in adapters::registry() {
+        for &kind in adapters::registry() {
             probe_cache.insert(kind, kind.probe());
         }
 

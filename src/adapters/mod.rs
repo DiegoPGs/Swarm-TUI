@@ -130,13 +130,13 @@ pub enum AdapterKind {
     Codex,
 }
 
-/// The adapter registry: iterate this to probe/list every known tool.
-pub fn registry() -> [AdapterKind; 3] {
-    [
-        AdapterKind::ClaudeCode,
-        AdapterKind::Antigravity,
-        AdapterKind::Codex,
-    ]
+/// The adapter registry: iterate this to probe/list every **active** tool.
+///
+/// Codex is suspended (ADR-0008): its variant, module, and dispatch arms stay
+/// compiled — reversal is restoring one entry here — but nothing iterates it,
+/// so it is never probed, offered in the picker, or spawned.
+pub fn registry() -> &'static [AdapterKind] {
+    &[AdapterKind::ClaudeCode, AdapterKind::Antigravity]
 }
 
 impl AdapterKind {
@@ -232,5 +232,21 @@ pub(crate) fn help_text(binary: &str, args: &[&str]) -> String {
             String::from_utf8_lossy(&out.stderr)
         ),
         Err(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_excludes_codex_while_suspended() {
+        assert_eq!(
+            registry(),
+            &[AdapterKind::ClaudeCode, AdapterKind::Antigravity]
+        );
+        // Reversal path (ADR-0008): the slug stays resolvable so historical
+        // registry rows keep mapping to the compiled-but-suspended adapter.
+        assert_eq!(AdapterKind::from_slug("codex"), Some(AdapterKind::Codex));
     }
 }
