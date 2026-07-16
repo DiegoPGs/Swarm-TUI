@@ -43,7 +43,9 @@ anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that the
 - Architecture changes require a new ADR (`docs/adr/000N-title.md`); supersede, never
   edit, an accepted ADR.
 - Everything CLI-specific stays inside its adapter module. `core` and `app` may only
-  speak `AgentEvent`, `SessionRecord`, and `AdapterCaps`.
+  speak `AgentEvent`, `SessionRecord`, `AdapterCaps`, and the data-only
+  launch/command vocabulary `LaunchIntent`, `LaunchOptions`, `NativeCommand`
+  (ADR-0009). Flag names and per-tool semantics never leave `src/adapters/`.
 - Facts about the three CLIs go in `docs/integrations/` with a verified/unverified
   marker and a date — never inline in code comments alone.
 

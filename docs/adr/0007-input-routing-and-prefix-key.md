@@ -38,6 +38,11 @@ Keymap (active only in the one-shot "awaiting command" state):
 | `r` | Refresh roster |
 | `?` | Keymap overlay |
 | `q` | Quit (confirm if any pane is alive; quitting kills remaining panes after confirmation) |
+| `:` | Command palette — inject a native slash command into the active session tab (added by ADR-0009, 2026-07-16) |
+
+*Amended by ADR-0009 (2026-07-16): the `:` row above was added when the command
+palette landed. The decision of this ADR — single Ctrl-Space prefix, one-shot
+command mode, double-press literal passthrough — is unchanged.*
 
 ## Alternatives rejected
 
