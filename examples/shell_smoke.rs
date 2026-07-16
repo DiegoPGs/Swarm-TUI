@@ -219,7 +219,25 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     d.wait_for("re-attach restores pane", TYPED, Duration::from_secs(5))?;
     d.snapshot("6-claude-reattached");
 
-    // 7. Close (confirmed): kills the pane child, records Failed (killed
+    // 7. Command palette (ADR-0009): prefix+`:` opens it on the session tab;
+    // type to filter; Esc closes. Enter is deliberately NEVER pressed here —
+    // injecting would execute a command in the real claude pane, which the
+    // dev rules forbid; the injection byte-path is covered against a fake
+    // pane in `src/app/palette.rs` tests instead.
+    d.send(PREFIX)?;
+    d.send(b":")?;
+    d.wait_for(
+        "palette opens",
+        "Commands — Claude Code",
+        Duration::from_secs(5),
+    )?;
+    d.send(b"status")?;
+    d.wait_for("palette filters", "/status", Duration::from_secs(5))?;
+    d.snapshot("6b-palette-filtered");
+    d.send(&[0x1b])?; // Esc — close without injecting
+    thread::sleep(Duration::from_millis(300));
+
+    // 8. Close (confirmed): kills the pane child, records Failed (killed
     // processes rarely exit 0), lands back on Home.
     d.send(PREFIX)?;
     d.send(b"x")?;

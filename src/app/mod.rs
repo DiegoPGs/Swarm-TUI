@@ -14,6 +14,7 @@
 
 pub mod home;
 pub mod keys;
+pub mod palette;
 pub mod reconcile;
 pub mod session_view;
 pub mod tabs;
@@ -30,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -203,6 +204,7 @@ pub struct App {
     pub probe_cache: HashMap<AdapterKind, Result<AdapterCaps, AdapterError>>,
     pub pending_confirm: Option<ConfirmAction>,
     pub new_session_picker: Option<PickerState>,
+    pub palette: Option<palette::PaletteState>,
     pub show_keymap_overlay: bool,
     /// Size newly spawned/live panes are kept at: terminal area minus the
     /// tab bar row. Recomputed every `draw()` call so it tracks real resizes
@@ -304,6 +306,7 @@ impl App {
                 probe_cache,
                 pending_confirm: None,
                 new_session_picker: None,
+                palette: None,
                 show_keymap_overlay: false,
                 pane_area_size,
             },
@@ -503,6 +506,10 @@ impl App {
             self.handle_picker_key(key);
             return false;
         }
+        if self.palette.is_some() {
+            self.handle_palette_key(key);
+            return false;
+        }
         if self.show_keymap_overlay {
             // Any key dismisses the overlay; ADR-0007 leaves the exact
             // indicator/dismiss UX to the implementation. Swallow the
@@ -591,6 +598,7 @@ impl App {
             KeyCode::Char('c') => {
                 self.new_session_picker = Some(PickerState::ChooseTool { selected: 0 });
             }
+            KeyCode::Char(':') => self.open_palette(),
             KeyCode::Char('d') => self.detach_active_tab(),
             KeyCode::Char('x') => {
                 if matches!(
@@ -623,6 +631,107 @@ impl App {
             _ => {}
         }
         quit_now
+    }
+
+    /// Open the command palette (prefix `:`, ADR-0009) — session tabs only,
+    /// and only when the pane is alive and the tool has a non-empty command
+    /// table. Silently a no-op otherwise (matching the other one-shot keys).
+    fn open_palette(&mut self) {
+        let Some(Tab::Session { session_id }) = self.tabs.items.get(self.tabs.active) else {
+            return;
+        };
+        let session_id = *session_id;
+        let Some(&pane_id) = self.pane_of_session.get(&session_id) else {
+            return;
+        };
+        if self.pane_host.is_exited(pane_id) {
+            return;
+        }
+        let Some(kind) = self
+            .record_for(session_id)
+            .and_then(|r| AdapterKind::from_slug(&r.tool))
+        else {
+            return;
+        };
+        let entries = kind.command_table();
+        if entries.is_empty() {
+            return;
+        }
+        self.palette = Some(palette::PaletteState::new(
+            pane_id,
+            kind.display_name(),
+            entries,
+        ));
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        let Some(pal) = self.palette.as_mut() else {
+            return;
+        };
+
+        // Argument sub-stage: free text for an entry that declared a hint.
+        if let Some(args) = pal.args.as_mut() {
+            match key.code {
+                KeyCode::Esc => pal.args = None,
+                KeyCode::Enter => {
+                    let entry = &pal.entries[args.command_index];
+                    let text = args.text.trim().to_string();
+                    let bytes =
+                        palette::injection_bytes(entry, (!text.is_empty()).then_some(&*text));
+                    let pane_id = pal.pane_id;
+                    self.palette = None;
+                    let _ = self.pane_host.write_input(pane_id, &bytes);
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    args.text.push(c);
+                }
+                KeyCode::Backspace => {
+                    args.text.pop();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Up => pal.selected = pal.selected.saturating_sub(1),
+            KeyCode::Down => {
+                let len = palette::filtered_indices(pal.entries, &pal.filter).len();
+                if pal.selected + 1 < len {
+                    pal.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let filtered = palette::filtered_indices(pal.entries, &pal.filter);
+                let Some(&entry_index) = filtered.get(pal.selected) else {
+                    return; // filter matches nothing — keep the palette open
+                };
+                let entry = &pal.entries[entry_index];
+                if entry.args_hint.is_some() {
+                    pal.args = Some(palette::ArgsState {
+                        command_index: entry_index,
+                        text: String::new(),
+                    });
+                } else {
+                    let bytes = palette::injection_bytes(entry, None);
+                    let pane_id = pal.pane_id;
+                    self.palette = None;
+                    let _ = self.pane_host.write_input(pane_id, &bytes);
+                }
+            }
+            // Letters feed the filter (↑/↓ own navigation); Ctrl-modified
+            // chords — including the global prefix — are ignored here.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                pal.filter.push(c);
+                pal.selected = 0;
+            }
+            KeyCode::Backspace => {
+                pal.filter.pop();
+                pal.selected = 0;
+            }
+            _ => {}
+        }
     }
 
     async fn handle_confirm_key(&mut self, action: ConfirmAction, key: KeyEvent) -> bool {
@@ -822,6 +931,9 @@ impl App {
         if let Some(picker) = &self.new_session_picker {
             self.draw_new_session_picker(frame, area, picker);
         }
+        if let Some(pal) = &self.palette {
+            self.draw_palette(frame, area, pal);
+        }
         if let Some(action) = self.pending_confirm {
             self.draw_confirm(frame, area, action);
         }
@@ -838,7 +950,7 @@ impl App {
             };
             frame.render_widget(
                 Paragraph::new(
-                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  d detach  x close  r refresh  ? help  q quit",
+                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  : palette  d detach  x close  r refresh  ? help  q quit",
                 )
                 .style(Style::default().add_modifier(Modifier::REVERSED)),
                 banner_area,
@@ -864,6 +976,7 @@ impl App {
             Line::from("  1-9     Jump to tab N"),
             Line::from("  n / p   Next / previous tab"),
             Line::from("  c       New session"),
+            Line::from("  :       Command palette (session tab)"),
             Line::from("  d       Detach"),
             Line::from("  x       Close tab (confirm)"),
             Line::from("  r       Refresh roster"),
@@ -952,6 +1065,63 @@ impl App {
                 frame.render_widget(Paragraph::new(lines).block(block), popup);
             }
         }
+    }
+
+    fn draw_palette(&self, frame: &mut Frame, area: Rect, pal: &palette::PaletteState) {
+        let popup = centered_rect(64, 60, area);
+        frame.render_widget(Clear, popup);
+
+        // Argument sub-stage: one entry, one free-text line, the tool's hint.
+        if let Some(args) = &pal.args {
+            let entry = &pal.entries[args.command_index];
+            let lines = vec![
+                Line::from(format!("{} {}▏", entry.inject, args.text)),
+                Line::from(""),
+                Line::from(format!("({})", entry.args_hint.unwrap_or(""))),
+                Line::from(""),
+                Line::from("Enter inject · empty = bare command · Esc back"),
+            ];
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{} — arguments", entry.name));
+            frame.render_widget(Paragraph::new(lines).block(block), popup);
+            return;
+        }
+
+        let filtered = palette::filtered_indices(pal.entries, &pal.filter);
+        let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(format!(
+            "› {}▏   (type to filter · ↑/↓ · Enter · Esc)",
+            pal.filter
+        )))];
+        items.extend(filtered.iter().enumerate().map(|(row, &entry_index)| {
+            let entry = &pal.entries[entry_index];
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:<14}", entry.name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.description),
+            ];
+            if entry.persists {
+                spans.push(Span::styled(
+                    "  [persists]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            let mut style = Style::default();
+            if row == pal.selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            ListItem::new(Line::from(spans)).style(style)
+        }));
+        if filtered.is_empty() {
+            items.push(ListItem::new("  (no matching command)"));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Commands — {}", pal.tool_display));
+        frame.render_widget(List::new(items).block(block), popup);
     }
 
     fn draw_confirm(&self, frame: &mut Frame, area: Rect, action: ConfirmAction) {
