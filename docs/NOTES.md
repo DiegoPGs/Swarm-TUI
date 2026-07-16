@@ -340,3 +340,121 @@ agy `--model` accepted argument format (supervised one-liner recorded); agy
 persistence nuance (owner-reported 🔶 vs. undistinguishing official docs); the
 three pre-existing agy live-dispatch items; everything codex (suspended,
 ADR-0008).
+
+## Milestone 2c — Stage 0: local validation (2026-07-16)
+
+**Gates: all green.** `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo check`, `cargo test` (54/54), and `cargo run --example
+fidelity_spike` all pass on the target machine. Installed versions this session:
+`claude` **2.1.211**, `agy` **1.1.3** (both unchanged since the 2b pass earlier
+today), codex still absent.
+
+**CI: green on main.** Two successful runs since the last entry —
+`29512367507` (push to main, 2026-07-16, the milestone-2b merge of PR #3) and the
+PR #3 run itself. Nothing needed enabling.
+
+**Fidelity spike re-run — ADR-0003 verdict unchanged.** claude: 800 ms to stable
+paint, the known 1-differing-line cursor-cell artifact (explained in the 2b
+Stage 0 entry). agy: 2802 ms to stable paint and — new since 2b — **"echo of
+typed chars: OK"**: the repo dir is now a trusted agy workspace (the 2b
+owner-authorized trust accept), so agy boots straight to its prompt instead of
+the char-swallowing trust dialog. Same 1-line cursor artifact. No doc change
+needed; ADR-0003 stands.
+
+## Milestone 2c — Stage 1: usage-surface research (2026-07-16)
+
+**Usage-submission authorization (owner-granted 2026-07-16, in the 2c brief).**
+The brief whitelists exactly four read-only display commands for submission in a
+dedicated probe pane: `/usage` + `/status` (claude), `/usage` + `/credits`
+(agy). Executed via `slash_probe`'s new `usage` mode
+(`cargo run --example slash_probe -- <claude|agy> usage`), one run per tool,
+four submissions total — each printed to the run log at the moment of the
+Enter. Nothing else was submitted; cleanup used Esc/backspace only. Execution
+notes, full disclosure: the claude probe pane is a real interactive spawn, so
+it created one native claude session (its ID is visible in the `/status`
+capture); the pane was killed at teardown and never touched swarm-tui's
+registry. The agy probe opened in the repo dir, which has been a trusted agy
+workspace since the 2b accept — no trust dialog appeared and no agy state
+changed.
+
+**Findings** (detail in `command-surfaces.md` → "Usage surfaces"): neither tool
+has a machine-readable or CLI-level usage surface — `--help` on both lists
+nothing quota-shaped, and `agy models` prints display names only. Usage lives
+only inside the TUIs: claude `/usage` = Settings→Usage tab with three plan
+windows, **"NN% used" bars and reset times**; agy `/usage` = Models & Quota
+page, per-group Weekly/Five-Hour bars whose percentage is quota **available**
+(inverted semantics vs. claude — normalization would drift, verbatim rendering
+it is); agy `/credits` = G1 credits panel ("not enabled" on this machine).
+ADR-0011's probe-pane mechanism therefore applies to **both** vendors.
+
+**Fixtures.** Real captures live only in gitignored `target/slash-probe/`
+(they contain the account email, plan tier, timezone, and live percentages —
+account state, never committed). Committed instead:
+`tests/fixtures/claude_usage.synthetic.txt` and
+`tests/fixtures/agy_usage.synthetic.txt`, hand-written to preserve each
+screen's structure with invented numbers, timezone, and email — same synthetic
+convention as `claude_agents_all.synthetic.json` (2b).
+
+## Milestone 2c complete — the swarm plan (2026-07-16)
+
+**What landed.** (1) The workspace roles file, `<launch cwd>/.swarm/swarm.json`
+(ADR-0010): schema v1, strict serde (`deny_unknown_fields`), roles as launch
+presets consumed by the new-session picker (listed above the raw tools),
+model/effort passed **verbatim**, startup commands injected in declared order
+after a stable first paint behind a type→verify-echo→Enter guard; registry
+schema v3 adds the `role` provenance column (v1 databases migrate through a
+v1→v2→v3 chain, each step its own transaction). The repo commits its own
+dogfood plan: `researcher` (agy, gemini-3.1-pro), `coder` (claude, opus-4.8,
+high), `advisor` (claude, sonnet-5, `/advisor fable`). (2) The Resources view
+(ADR-0011): prefix+`u`, one block per active vendor — plan role assignments,
+the vendor's own `/usage` screen captured verbatim by a hidden, unregistered,
+short-lived probe pane on **manual** refresh, a best-effort `%` headline, and
+a relative "as of Xm ago" timestamp. 27 new tests (81 total, was 54); the
+shell_smoke harness gained a Resources-toggle step and roles-aware picker
+navigation.
+
+**Probe-exception use (stage 1 entry above).** The four owner-whitelisted
+submissions (`/usage`+`/status` claude, `/usage`+`/credits` agy) were executed
+exactly once each via `slash_probe`'s usage mode; nothing else was ever
+submitted into a real CLI this milestone. The runtime Resources refresh
+injects `/usage` as user-initiated product behavior (ADR-0011) — no agent
+triggered it this session; the live path is on the owner smoke checklist.
+
+**Deviations / spec-premise corrections (all owner-decided in-session):**
+
+1. *"The existing ADR-0009 confirm" did not exist* — 2b shipped the
+   `[persists]` badge only; the palette injects immediately. The confirm built
+   in 2c applies to **startup injection only** (owner's pick); the attended
+   palette is unchanged, parity noted in ADR-0010 as a possible follow-up.
+2. *"as of HH:MM"* needs a timezone dependency std Rust doesn't have; owner
+   chose the roster's relative `format_age` style ("as of 3m ago") over a new
+   dep or UTC.
+3. *"Roster tooltip" for `purpose`* has no terminal equivalent — purpose
+   renders in the picker role line; the roster shows the role name column; the
+   session status line appends `· role <name>`.
+4. The plan's `role_spawn_stamps_role_and_seeds_startup_queue` test is not
+   unit-driven: exercising `open_new_session`'s happy path would spawn the
+   real CLI binary from a test (out of bounds). Every branch around it is
+   covered (picker no-op on failed probe, queue seeding/confirm/decline
+   through the real key path, persists precomputation); the spawn path itself
+   is on the owner smoke checklist.
+5. Runtime probes send `/usage` only; agy `/credits` stays research-recorded
+   (fixture-less) as a future refresh extension.
+6. Two-step injection (type, verify echo, then Enter) is stricter than the
+   brief's "inject after first paint" — grounded in the recorded 2b
+   trust-dialog behavior (dialogs swallow characters); the failure mode is
+   skip-and-note, never a blind Enter.
+
+**Nothing observed this milestone contradicts an accepted ADR.** ADR-0007 was
+amended in place (the `u` row) per the ADR-0009 precedent; ADR-0008's reversal
+note gains a compiler-guided second touch point (`adapters::all_kinds()`,
+pinned by test).
+
+**Open ⬜ after 2c** (see command-surfaces.md "Usage surfaces"): whether claude
+`/usage` shows all plan types (observed on Claude Pro only); agy Models &
+Quota reset times when a bucket is partially consumed (both buckets were at
+100.00% available during capture); agy `/credits` appearance with AI Credits
+enabled; plus everything still open from 2b (agy `--model` argument format —
+relevant to the dogfood `researcher` role's `gemini-3.1-pro` string — `/model`
+persistence, `/schedule` timer lifetime, claude `/effort max` stickiness, agy
+live-dispatch items, everything codex).

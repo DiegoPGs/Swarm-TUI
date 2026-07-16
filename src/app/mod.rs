@@ -17,7 +17,9 @@ pub mod keys;
 pub mod palette;
 pub mod reconcile;
 pub mod session_view;
+pub mod startup;
 pub mod tabs;
+pub mod usage;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
@@ -39,12 +41,14 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use crate::adapters::claude_code::ClaudeCode;
 use crate::adapters::{self, AdapterCaps, AdapterError, AdapterKind, CliAdapter};
 use crate::core::config::SwarmTuiConfig;
+use crate::core::plan::{Role, SwarmPlan};
 use crate::core::session::{SessionMode, SessionRecord, SessionStatus};
 use crate::pty::local::LocalPaneHost;
 use crate::pty::{PaneHost, PaneId, PaneSize};
 use crate::store::Registry;
 
 use home::{HomeView, RosterEntry};
+use startup::{StartupCommand, StartupQueue};
 use tabs::{SessionId, Tab, Tabs};
 
 // ---------------------------------------------------------------------------
@@ -143,6 +147,13 @@ pub enum InputMode {
 pub enum ConfirmAction {
     CloseActiveTab,
     Quit,
+    /// A role startup command matching a `persists: true` command-table entry
+    /// wants injecting (ADR-0010) — `y` injects, `n`/Esc skips that entry and
+    /// the queue continues. NEW in 2c: ADR-0009 shipped badge-only, the
+    /// attended palette still injects without this confirm.
+    StartupInjection {
+        session_id: SessionId,
+    },
 }
 
 /// The new-session picker, now two-stage (ADR-0009): choose a tool, then —
@@ -189,6 +200,98 @@ fn build_launch_options(
     adapters::LaunchOptions { model, effort }
 }
 
+/// One selectable row of the new-session picker's first stage (ADR-0010):
+/// swarm-plan roles list above the raw tools; section headers are rendering
+/// artifacts, not items — `PickerState::ChooseTool.selected` indexes this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerItem {
+    Role {
+        name: String,
+        kind: AdapterKind,
+        /// Prebuilt display line: `name — tool · model/effort — purpose`.
+        label: String,
+    },
+    Tool(AdapterKind),
+}
+
+/// Roles (alphabetical — `SwarmPlan.roles` is a `BTreeMap`) above tools
+/// (`registry()` order). Pure so the key handler and the renderer can never
+/// disagree about indexing.
+fn picker_items(plan: Option<&SwarmPlan>) -> Vec<PickerItem> {
+    let mut items = Vec::new();
+    if let Some(plan) = plan {
+        for (name, role) in &plan.roles {
+            // Validated as an active slug at load time; a miss here would be
+            // a bug, and skipping beats panicking in a UI path.
+            let Some(kind) = AdapterKind::from_slug(&role.tool) else {
+                continue;
+            };
+            let launch = match (role.model.as_deref(), role.effort.as_deref()) {
+                (Some(m), Some(e)) => format!(" · {m}/{e}"),
+                (Some(m), None) => format!(" · {m}"),
+                (None, Some(e)) => format!(" · effort {e}"),
+                (None, None) => String::new(),
+            };
+            let purpose = role
+                .purpose
+                .as_deref()
+                .map(|p| format!(" — {p}"))
+                .unwrap_or_default();
+            let label = format!("{name} — {}{launch}{purpose}", role.tool);
+            items.push(PickerItem::Role {
+                name: name.clone(),
+                kind,
+                label,
+            });
+        }
+    }
+    items.extend(adapters::registry().iter().copied().map(PickerItem::Tool));
+    items
+}
+
+/// What a role launch adds on top of a raw-tool launch (bundled so
+/// `open_new_session` keeps a small signature).
+struct RoleSpawn {
+    name: String,
+    commands: Vec<StartupCommand>,
+}
+
+/// Precompute each startup command's confirm requirement: its first token
+/// matches a `command_table()` entry with `persists: true` (ADR-0010). Done
+/// here — not in `startup` — so the queue never needs the adapter tables.
+fn role_startup_commands(kind: AdapterKind, role: &Role) -> Vec<StartupCommand> {
+    role.startup_commands
+        .iter()
+        .map(|text| {
+            let first = text.split_whitespace().next().unwrap_or("");
+            let needs_confirm = kind
+                .command_table()
+                .iter()
+                .any(|e| e.name == first && e.persists);
+            StartupCommand {
+                text: text.clone(),
+                needs_confirm,
+            }
+        })
+        .collect()
+}
+
+/// Load `.swarm/swarm.json` from the launch cwd (ADR-0010). Both slug lists
+/// come from `adapters` so no tool name is ever spelled here; errors come
+/// back as the one-line string the picker renders.
+fn load_swarm_plan() -> (Option<SwarmPlan>, Option<String>) {
+    let dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => return (None, Some(format!("launch cwd unavailable: {e}"))),
+    };
+    let active: Vec<&str> = adapters::registry().iter().map(|k| k.id()).collect();
+    let known: Vec<&str> = adapters::all_kinds().iter().map(|k| k.id()).collect();
+    match SwarmPlan::load(&dir, &active, &known) {
+        Ok(plan) => (plan, None),
+        Err(e) => (None, Some(e.to_string())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
@@ -206,6 +309,22 @@ pub struct App {
     pub new_session_picker: Option<PickerState>,
     pub palette: Option<palette::PaletteState>,
     pub show_keymap_overlay: bool,
+    /// The workspace roles file, when present and valid (ADR-0010); reloaded
+    /// with the roster on prefix+`r`.
+    pub plan: Option<SwarmPlan>,
+    /// One-line load error rendered in the picker (`plan` is `None` then).
+    pub plan_error: Option<String>,
+    /// In-flight role startup-command injections (ADR-0010).
+    pub startup: StartupQueue,
+    /// Resources view toggle (prefix+`u`, ADR-0011): renders instead of the
+    /// roster in the Home tab's body.
+    pub show_resources: bool,
+    pub resources_scroll: usize,
+    /// Per-vendor last usage capture (ADR-0011).
+    pub usage: HashMap<AdapterKind, usage::UsageCapture>,
+    /// In-flight hidden usage probes — at most one per vendor; refresh keys
+    /// no-op while one runs.
+    pub probes: HashMap<AdapterKind, usage::ProbePane>,
     /// Size newly spawned/live panes are kept at: terminal area minus the
     /// tab bar row. Recomputed every `draw()` call so it tracks real resizes
     /// without needing a dedicated `Event::Resize` handler.
@@ -295,6 +414,8 @@ impl App {
             cols: cols.max(1),
         };
 
+        let (plan, plan_error) = load_swarm_plan();
+
         Ok((
             App {
                 tabs: Tabs::new(),
@@ -308,6 +429,13 @@ impl App {
                 new_session_picker: None,
                 palette: None,
                 show_keymap_overlay: false,
+                plan,
+                plan_error,
+                startup: StartupQueue::default(),
+                show_resources: false,
+                resources_scroll: 0,
+                usage: HashMap::new(),
+                probes: HashMap::new(),
                 pane_area_size,
             },
             pane_changed_rx,
@@ -380,7 +508,17 @@ impl App {
                     (None, Some(e)) => format!(" · effort {e}"),
                     (None, None) => String::new(),
                 };
-                format!("{}{native}{launch}  —  {HINT}", r.tool)
+                let role = r
+                    .role
+                    .as_deref()
+                    .map(|n| format!(" · role {n}"))
+                    .unwrap_or_default();
+                let skipped = if self.startup.failed_sessions().contains(&session_id) {
+                    " · startup commands skipped"
+                } else {
+                    ""
+                };
+                format!("{}{native}{launch}{role}{skipped}  —  {HINT}", r.tool)
             }
             None => format!("session #{session_id}  —  {HINT}"),
         }
@@ -400,6 +538,7 @@ impl App {
         &mut self,
         kind: AdapterKind,
         opts: adapters::LaunchOptions,
+        role: Option<RoleSpawn>,
     ) -> Result<(), AppError> {
         let hint = uuid::Uuid::new_v4().to_string();
         let intent = adapters::LaunchIntent::Fresh {
@@ -430,10 +569,16 @@ impl App {
             cost_usd: None,
             model: opts.model,
             effort: opts.effort,
+            role: role.as_ref().map(|r| r.name.clone()),
         };
         self.registry.upsert(&record)?;
         self.pane_of_session.insert(record.id, pane_id);
         self.tabs.promote(record.id);
+        if let Some(role) = role {
+            // Startup commands wait for first paint; the tick drives them.
+            self.startup
+                .seed(record.id, pane_id, role.name, role.commands);
+        }
         self.refresh_roster()?;
         Ok(())
     }
@@ -552,6 +697,26 @@ impl App {
     }
 
     fn handle_home_key(&mut self, key: KeyEvent) {
+        // Resources view (ADR-0011) takes over Home-local keys while shown.
+        if self.show_resources {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('u') => self.show_resources = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.resources_scroll = self.resources_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.resources_scroll = self.resources_scroll.saturating_add(1);
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    let idx = (c as usize - '0' as usize) - 1;
+                    if let Some(&kind) = adapters::registry().get(idx) {
+                        self.refresh_usage(kind);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.home.select_prev(),
             KeyCode::Down | KeyCode::Char('j') => self.home.select_next(),
@@ -563,6 +728,43 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// User-initiated usage refresh (ADR-0011): spawn the hidden probe pane
+    /// for `kind` unless one is already in flight or the vendor declares no
+    /// usage command. The pane goes into `probes` only — never into
+    /// `pane_of_session`, tabs, or the registry.
+    fn refresh_usage(&mut self, kind: AdapterKind) {
+        if self.probes.contains_key(&kind) {
+            return;
+        }
+        if !matches!(self.probe_cache.get(&kind), Some(Ok(_))) {
+            return; // not installed — no block to refresh
+        }
+        let Some(inject) = usage::probe_command_for(kind) else {
+            return;
+        };
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        let cmd = kind.interactive_cmd(
+            &adapters::LaunchIntent::Fresh {
+                session_id_hint: None,
+            },
+            &adapters::LaunchOptions::default(),
+            &cwd,
+        );
+        match usage::ProbePane::spawn(&mut self.pane_host, cmd, inject) {
+            Ok(probe) => {
+                self.probes.insert(kind, probe);
+            }
+            Err(e) => {
+                self.usage.insert(
+                    kind,
+                    usage::UsageCapture::failure(format!("probe spawn failed: {e:?}")),
+                );
+            }
         }
     }
 
@@ -613,16 +815,28 @@ impl App {
                 // (Stage D, ADR-0002) and fold the `ReconciledOnly` rows in
                 // additively — never dropping the `Registered` rows
                 // `refresh_roster` just rebuilt, never inventing a registry
-                // row for a reconciled-only entry.
+                // row for a reconciled-only entry. Also reload the swarm
+                // plan (ADR-0010): refresh means "re-read the world".
                 let _ = self.refresh_roster();
                 let reconciled = reconciled_claude_agents(&self.probe_cache).await;
                 self.home.roster.extend(reconciled);
+                let (plan, plan_error) = load_swarm_plan();
+                self.plan = plan;
+                self.plan_error = plan_error;
+            }
+            KeyCode::Char('u') => {
+                // Resources view (ADR-0011) lives in the Home tab's body.
+                self.tabs.active = 0;
+                self.show_resources = !self.show_resources;
             }
             KeyCode::Char('?') => {
                 self.show_keymap_overlay = !self.show_keymap_overlay;
             }
             KeyCode::Char('q') => {
                 if self.pane_of_session.is_empty() {
+                    // Session panes are gone; make sure no hidden probe pane
+                    // outlives the app either (ADR-0011).
+                    self.kill_probe_panes();
                     quit_now = true;
                 } else {
                     self.pending_confirm = Some(ConfirmAction::Quit);
@@ -631,6 +845,12 @@ impl App {
             _ => {}
         }
         quit_now
+    }
+
+    fn kill_probe_panes(&mut self) {
+        for (_, probe) in self.probes.drain() {
+            let _ = self.pane_host.kill(probe.pane_id());
+        }
     }
 
     /// Open the command palette (prefix `:`, ADR-0009) — session tabs only,
@@ -744,10 +964,18 @@ impl App {
             return false; // keep prompting until the user answers
         }
         self.pending_confirm = None;
-        if !confirmed {
-            return false;
-        }
         match action {
+            // Unlike the destructive confirms, a decline here still acts:
+            // it skips the pending entry and the queue continues (ADR-0010).
+            ConfirmAction::StartupInjection { session_id } => {
+                if confirmed {
+                    self.startup.approve(session_id);
+                } else {
+                    self.startup.skip_current(session_id);
+                }
+                false
+            }
+            _ if !confirmed => false,
             ConfirmAction::CloseActiveTab => {
                 self.perform_close_active_tab().await;
                 false
@@ -755,18 +983,58 @@ impl App {
             ConfirmAction::Quit => {
                 // Fire-and-forget: a bulk quit-kill doesn't update registry
                 // status (out of scope for a clean-shutdown path) — just
-                // make sure nothing is left running.
+                // make sure nothing is left running, hidden probe panes
+                // included (ADR-0011).
                 for &pane_id in self.pane_of_session.values() {
                     let _ = self.pane_host.kill(pane_id);
                 }
+                self.kill_probe_panes();
                 true
             }
         }
     }
 
+    /// Advance the background state machines (role startup injections,
+    /// ADR-0010; hidden usage probes, ADR-0011). Called from the event-loop
+    /// tick — the machines rate-limit themselves, so every-33ms is fine.
+    /// Returns true when anything changed (the caller marks the frame
+    /// dirty). Also raises the persists-confirm modal when a queue wants one
+    /// and the confirm slot is free.
+    fn drive_background(&mut self) -> bool {
+        let mut changed = self.startup.drive(&mut self.pane_host);
+        if self.pending_confirm.is_none() {
+            if let Some(session_id) = self.startup.next_confirm_request() {
+                self.pending_confirm = Some(ConfirmAction::StartupInjection { session_id });
+                changed = true;
+            }
+        }
+
+        // Usage probes: capture-or-abort ends with the pane killed and the
+        // probe dropped; the result lands in the per-vendor usage slot.
+        let mut done: Vec<(AdapterKind, usage::UsageCapture)> = Vec::new();
+        for (kind, probe) in self.probes.iter_mut() {
+            match probe.drive(&mut self.pane_host) {
+                usage::ProbeStep::Idle => {}
+                usage::ProbeStep::Changed => changed = true,
+                usage::ProbeStep::Finished(capture) => done.push((*kind, capture)),
+                usage::ProbeStep::Aborted(msg) => {
+                    done.push((*kind, usage::UsageCapture::failure(msg)));
+                }
+            }
+        }
+        for (kind, capture) in done {
+            if let Some(probe) = self.probes.remove(&kind) {
+                let _ = self.pane_host.kill(probe.pane_id());
+            }
+            self.usage.insert(kind, capture);
+            changed = true;
+        }
+        changed
+    }
+
     fn handle_picker_key(&mut self, key: KeyEvent) {
-        let kinds = adapters::registry();
-        let len = kinds.len();
+        let items = picker_items(self.plan.as_ref());
+        let len = items.len();
         // Take the state out so the arms below can call &mut self methods;
         // every path either reinstalls an updated state or ends the picker.
         let Some(picker) = self.new_session_picker.take() else {
@@ -785,29 +1053,61 @@ impl App {
                     });
                 }
                 KeyCode::Esc => {}
-                KeyCode::Enter => {
-                    let kind = kinds[selected];
-                    match self.probe_cache.get(&kind) {
-                        Some(Ok(caps)) if caps.launch.any() => {
-                            // Tool declares launch options → options form.
-                            self.new_session_picker = Some(PickerState::Options {
-                                kind,
-                                decl: caps.launch,
-                                model: String::new(),
-                                effort_idx: 0,
-                            });
-                        }
-                        Some(Ok(_)) => {
-                            let _ = self.open_new_session(kind, adapters::LaunchOptions::default());
-                        }
-                        _ => {
-                            // Failed-probe ("not installed") entries are greyed
-                            // and disabled per ARCHITECTURE.md — Enter is a
-                            // no-op and the picker stays open.
+                KeyCode::Enter => match items.get(selected) {
+                    Some(PickerItem::Role { name, kind, .. }) => {
+                        let kind = *kind;
+                        // Greyed/disabled unless the tool's probe succeeded,
+                        // same rule as raw tools below.
+                        if !matches!(self.probe_cache.get(&kind), Some(Ok(_))) {
                             self.new_session_picker = Some(PickerState::ChooseTool { selected });
+                        } else if let Some(role) =
+                            self.plan.as_ref().and_then(|p| p.roles.get(name)).cloned()
+                        {
+                            // The role IS the preset — no options form
+                            // (ADR-0010); its model/effort pass verbatim.
+                            let opts = adapters::LaunchOptions {
+                                model: role.model.clone(),
+                                effort: role.effort.clone(),
+                            };
+                            let spawn = RoleSpawn {
+                                name: name.clone(),
+                                commands: role_startup_commands(kind, &role),
+                            };
+                            let _ = self.open_new_session(kind, opts, Some(spawn));
                         }
                     }
-                }
+                    Some(PickerItem::Tool(kind)) => {
+                        let kind = *kind;
+                        match self.probe_cache.get(&kind) {
+                            Some(Ok(caps)) if caps.launch.any() => {
+                                // Tool declares launch options → options form.
+                                self.new_session_picker = Some(PickerState::Options {
+                                    kind,
+                                    decl: caps.launch,
+                                    model: String::new(),
+                                    effort_idx: 0,
+                                });
+                            }
+                            Some(Ok(_)) => {
+                                let _ = self.open_new_session(
+                                    kind,
+                                    adapters::LaunchOptions::default(),
+                                    None,
+                                );
+                            }
+                            _ => {
+                                // Failed-probe ("not installed") entries are greyed
+                                // and disabled per ARCHITECTURE.md — Enter is a
+                                // no-op and the picker stays open.
+                                self.new_session_picker =
+                                    Some(PickerState::ChooseTool { selected });
+                            }
+                        }
+                    }
+                    None => {
+                        self.new_session_picker = Some(PickerState::ChooseTool { selected });
+                    }
+                },
                 _ => {
                     self.new_session_picker = Some(PickerState::ChooseTool { selected });
                 }
@@ -819,13 +1119,17 @@ impl App {
                 mut effort_idx,
             } => match key.code {
                 KeyCode::Esc => {
-                    // Back to the tool list, cursor restored onto this tool.
-                    let selected = kinds.iter().position(|k| *k == kind).unwrap_or(0);
+                    // Back to the first stage, cursor restored onto this
+                    // tool's row (roles list above the tools).
+                    let selected = items
+                        .iter()
+                        .position(|item| matches!(item, PickerItem::Tool(k) if *k == kind))
+                        .unwrap_or(0);
                     self.new_session_picker = Some(PickerState::ChooseTool { selected });
                 }
                 KeyCode::Enter => {
                     let opts = build_launch_options(&model, effort_idx, &decl);
-                    let _ = self.open_new_session(kind, opts);
+                    let _ = self.open_new_session(kind, opts, None);
                 }
                 KeyCode::Char(c) if decl.model.is_some() => {
                     model.push(c);
@@ -920,8 +1224,19 @@ impl App {
                 }
             }
             _ => {
-                let detached = self.detached_set();
-                home::render_home(frame, body_area, &self.home, &detached);
+                if self.show_resources {
+                    usage::render_resources(
+                        frame,
+                        body_area,
+                        self.plan.as_ref(),
+                        &self.usage,
+                        &self.probes,
+                        self.resources_scroll,
+                    );
+                } else {
+                    let detached = self.detached_set();
+                    home::render_home(frame, body_area, &self.home, &detached);
+                }
             }
         }
 
@@ -950,7 +1265,7 @@ impl App {
             };
             frame.render_widget(
                 Paragraph::new(
-                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  : palette  d detach  x close  r refresh  ? help  q quit",
+                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  : palette  d detach  x close  r refresh  u usage  ? help  q quit",
                 )
                 .style(Style::default().add_modifier(Modifier::REVERSED)),
                 banner_area,
@@ -979,7 +1294,8 @@ impl App {
             Line::from("  :       Command palette (session tab)"),
             Line::from("  d       Detach"),
             Line::from("  x       Close tab (confirm)"),
-            Line::from("  r       Refresh roster"),
+            Line::from("  r       Refresh roster + swarm plan"),
+            Line::from("  u       Resources view (usage per vendor)"),
             Line::from("  ?       Toggle this overlay"),
             Line::from("  q       Quit (confirm if any pane alive)"),
             Line::from(""),
@@ -994,36 +1310,69 @@ impl App {
     fn draw_new_session_picker(&self, frame: &mut Frame, area: Rect, picker: &PickerState) {
         match picker {
             PickerState::ChooseTool { selected } => {
-                let popup = centered_rect(50, 40, area);
+                let popup = centered_rect(56, 50, area);
                 frame.render_widget(Clear, popup);
 
-                let kinds = adapters::registry();
-                let items: Vec<ListItem> = kinds
+                // Selection indexes `picker_items()`; the headers and the
+                // plan-error line below are rendering-only rows.
+                let items = picker_items(self.plan.as_ref());
+                let has_roles = items
                     .iter()
-                    .enumerate()
-                    .map(|(i, kind)| {
-                        let installed = matches!(self.probe_cache.get(kind), Some(Ok(_)));
-                        let label = if installed {
-                            kind.display_name().to_string()
-                        } else {
-                            format!("{} (not installed)", kind.display_name())
-                        };
-                        let mut style = if installed {
-                            Style::default()
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
-                        if i == *selected {
-                            style = style.add_modifier(Modifier::REVERSED);
+                    .any(|item| matches!(item, PickerItem::Role { .. }));
+
+                let header_style = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD);
+                let mut rows: Vec<ListItem> = Vec::new();
+                if let Some(err) = &self.plan_error {
+                    rows.push(
+                        ListItem::new(Line::from(err.clone()))
+                            .style(Style::default().fg(Color::Red)),
+                    );
+                }
+                if has_roles {
+                    rows.push(
+                        ListItem::new(format!("Roles — {}", crate::core::plan::PLAN_RELATIVE_PATH))
+                            .style(header_style),
+                    );
+                }
+                for (i, item) in items.iter().enumerate() {
+                    if has_roles && matches!(item, PickerItem::Tool(_)) {
+                        let first_tool = items
+                            .iter()
+                            .position(|it| matches!(it, PickerItem::Tool(_)));
+                        if first_tool == Some(i) {
+                            rows.push(ListItem::new("Tools").style(header_style));
                         }
-                        ListItem::new(label).style(style)
-                    })
-                    .collect();
+                    }
+                    let (kind, label) = match item {
+                        PickerItem::Role { kind, label, .. } => (kind, format!("  {label}")),
+                        PickerItem::Tool(kind) => {
+                            let indent = if has_roles { "  " } else { "" };
+                            (kind, format!("{indent}{}", kind.display_name()))
+                        }
+                    };
+                    let installed = matches!(self.probe_cache.get(kind), Some(Ok(_)));
+                    let label = if installed {
+                        label
+                    } else {
+                        format!("{label} (not installed)")
+                    };
+                    let mut style = if installed {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    if i == *selected {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    rows.push(ListItem::new(label).style(style));
+                }
 
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .title("New session — Enter to select, Esc to cancel");
-                frame.render_widget(List::new(items).block(block), popup);
+                frame.render_widget(List::new(rows).block(block), popup);
             }
             PickerState::Options {
                 kind,
@@ -1129,12 +1478,24 @@ impl App {
         frame.render_widget(Clear, popup);
         let message = match action {
             ConfirmAction::CloseActiveTab => {
-                "Close this session? This kills the underlying process. [y/n]"
+                "Close this session? This kills the underlying process. [y/n]".to_string()
             }
-            ConfirmAction::Quit => "Quit swarm-tui? This kills all running panes. [y/n]",
+            ConfirmAction::Quit => {
+                "Quit swarm-tui? This kills all running panes. [y/n]".to_string()
+            }
+            ConfirmAction::StartupInjection { session_id } => self
+                .startup
+                .confirm_prompt(session_id)
+                .map(|p| format!("{p} [y/n = skip]"))
+                .unwrap_or_else(|| "Inject startup command? [y/n = skip]".to_string()),
         };
         let block = Block::default().borders(Borders::ALL).title("Confirm");
-        frame.render_widget(Paragraph::new(message).block(block), popup);
+        frame.render_widget(
+            Paragraph::new(message)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(block),
+            popup,
+        );
     }
 }
 
@@ -1208,6 +1569,9 @@ pub async fn run(config: SwarmTuiConfig) -> Result<(), AppError> {
                 dirty = true;
             }
             _ = tick.tick() => {
+                if app.drive_background() {
+                    dirty = true;
+                }
                 if dirty {
                     terminal.draw(|frame| app.draw(frame))?;
                     dirty = false;
@@ -1245,6 +1609,50 @@ mod tests {
         assert_eq!(opts, adapters::LaunchOptions::default());
     }
 
+    #[test]
+    fn picker_items_lists_roles_alphabetically_above_tools() {
+        use std::collections::BTreeMap;
+
+        let mk = |tool: &str| Role {
+            tool: tool.to_string(),
+            model: None,
+            effort: None,
+            purpose: None,
+            startup_commands: vec![],
+        };
+        let mut roles = BTreeMap::new();
+        roles.insert("researcher".to_string(), mk("antigravity"));
+        roles.insert("advisor".to_string(), mk("claude-code"));
+        roles.insert("coder".to_string(), mk("claude-code"));
+        let plan = SwarmPlan { roles };
+
+        let names: Vec<String> = picker_items(Some(&plan))
+            .iter()
+            .map(|item| match item {
+                PickerItem::Role { name, .. } => format!("role:{name}"),
+                PickerItem::Tool(kind) => format!("tool:{}", kind.id()),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "role:advisor",
+                "role:coder",
+                "role:researcher",
+                "tool:claude-code",
+                "tool:antigravity",
+            ]
+        );
+
+        // No plan → exactly today's picker: active tools, registry order.
+        let items = picker_items(None);
+        assert_eq!(items.len(), adapters::registry().len());
+        assert!(matches!(
+            items[0],
+            PickerItem::Tool(AdapterKind::ClaudeCode)
+        ));
+    }
+
     // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
 
     fn test_record(id: u64, tool: &str) -> SessionRecord {
@@ -1261,19 +1669,27 @@ mod tests {
             cost_usd: None,
             model: None,
             effort: None,
+            role: None,
         }
     }
 
     /// An `App` with one registered session backed by a fake `sh -c cat`
     /// pane. Session id 1; the session tab is NOT promoted (tests do that).
     fn app_with_cat_pane(tool: &str) -> (App, tempfile::TempDir) {
+        app_with_pane(tool, "cat")
+    }
+
+    /// Like `app_with_cat_pane`, but with a chosen `sh -c` script — startup
+    /// tests need a pane that paints something before echoing (`echo ready;
+    /// cat`), since the queue waits for a stable non-blank paint.
+    fn app_with_pane(tool: &str, script: &str) -> (App, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let registry = Registry::open(&tmp.path().join("registry.db")).expect("open registry");
         // Dropping the change-notification receiver is fine: reader threads
         // send best-effort (`let _ =`) and nothing here polls redraws.
         let (mut pane_host, _pane_changed_rx) = LocalPaneHost::new();
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg("cat");
+        cmd.arg("-c").arg(script);
         let pane_id = pane_host
             .spawn(cmd, PaneSize { rows: 24, cols: 80 })
             .expect("spawn fake pane");
@@ -1291,6 +1707,13 @@ mod tests {
             new_session_picker: None,
             palette: None,
             show_keymap_overlay: false,
+            plan: None,
+            plan_error: None,
+            startup: StartupQueue::default(),
+            show_resources: false,
+            resources_scroll: 0,
+            usage: HashMap::new(),
+            probes: HashMap::new(),
             pane_area_size: PaneSize { rows: 24, cols: 80 },
         };
         (app, tmp)
@@ -1372,5 +1795,124 @@ mod tests {
             seen.contains("/status"),
             "injected command never reached the pane; screen:\n{seen}"
         );
+    }
+
+    // -- roles wiring (ADR-0010; fake panes only — no wrapped CLI) -----------
+
+    #[test]
+    fn role_startup_commands_flags_persists_entries() {
+        let role = Role {
+            tool: "claude-code".to_string(),
+            model: None,
+            effort: None,
+            purpose: None,
+            startup_commands: vec![
+                "/model opus".to_string(),     // in the table, persists → confirm
+                "/status".to_string(),         // in the table, transient
+                "/advisor fable".to_string(),  // in the table, transient
+                "/not-a-real-cmd".to_string(), // absent from the table
+            ],
+        };
+        let flags: Vec<bool> = role_startup_commands(AdapterKind::ClaudeCode, &role)
+            .iter()
+            .map(|c| c.needs_confirm)
+            .collect();
+        assert_eq!(flags, vec![true, false, false, false]);
+    }
+
+    #[test]
+    fn enter_on_role_with_failed_probe_is_a_noop() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // A plan with one role, but an empty probe cache — the role renders
+        // greyed and Enter must neither spawn nor close the picker.
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "advisor".to_string(),
+            Role {
+                tool: "claude-code".to_string(),
+                model: Some("sonnet-5".to_string()),
+                effort: None,
+                purpose: None,
+                startup_commands: vec!["/advisor fable".to_string()],
+            },
+        );
+        app.plan = Some(SwarmPlan { roles });
+        app.new_session_picker = Some(PickerState::ChooseTool { selected: 0 });
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(
+                app.new_session_picker,
+                Some(PickerState::ChooseTool { selected: 0 })
+            ),
+            "picker must stay open on the greyed role"
+        );
+        assert!(
+            app.registry.all().expect("registry").is_empty(),
+            "nothing may be registered from a no-op Enter"
+        );
+    }
+
+    /// The full modal wiring: drive_background raises the persists confirm,
+    /// `n` through the real key path skips that entry, and the queue then
+    /// continues with the next command into the fake pane.
+    #[tokio::test]
+    async fn startup_confirm_flows_through_the_app_modal() {
+        let (mut app, _tmp) = app_with_pane("claude-code", "echo ready; cat");
+        let pane_id = app.pane_of_session[&1];
+        app.startup.seed(
+            1,
+            pane_id,
+            "coder".to_string(),
+            vec![
+                StartupCommand {
+                    text: "/model opus".to_string(),
+                    needs_confirm: true,
+                },
+                StartupCommand {
+                    text: "/plain after".to_string(),
+                    needs_confirm: false,
+                },
+            ],
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.pending_confirm.is_none() && Instant::now() < deadline {
+            app.drive_background();
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+        assert_eq!(
+            app.pending_confirm,
+            Some(ConfirmAction::StartupInjection { session_id: 1 })
+        );
+
+        // Decline via the real key path — skips the entry, queue continues.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .await;
+        assert!(app.pending_confirm.is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            app.drive_background();
+            seen = app
+                .pane_host
+                .with_screen(pane_id, |s| s.contents())
+                .expect("screen");
+            if seen.contains("/plain after") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+        assert!(
+            seen.contains("/plain after"),
+            "queue never continued past the declined entry; screen:\n{seen}"
+        );
+        assert!(
+            !seen.contains("/model opus"),
+            "declined command was injected anyway; screen:\n{seen}"
+        );
+        assert!(app.startup.failed_sessions().is_empty());
     }
 }

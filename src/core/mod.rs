@@ -8,5 +8,6 @@
 
 pub mod config;
 pub mod events;
+pub mod plan;
 pub mod session;
 pub mod task;

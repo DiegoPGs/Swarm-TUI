@@ -21,6 +21,9 @@ thread.
 | --- | --- | --- | --- |
 | TUI shell | `src/app/` | tab bar, keymap, command palette, layout, rendering loop | no |
 | Home view | `src/app/home.rs` | roster, task input, dispatch/broadcast UI, event timeline | no |
+| Resources view | `src/app/usage.rs` | per-vendor usage captures + hidden probe panes (ADR-0011) | no (concept key `/usage` only) |
+| Swarm plan | `src/core/plan.rs` | load/validate `.swarm/swarm.json` roles (ADR-0010) | no (slug lists passed in) |
+| Startup queue | `src/app/startup.rs` | role startup-command injection: paint wait, echo guard, confirm | no |
 | Session view | `src/app/session_view.rs` | renders one PTY grid, forwards keystrokes | no |
 | Task router | `src/core/task.rs` | maps a home-view task to target adapter(s) + guardrails | capability level only |
 | Event bus | `src/core/events.rs` | normalized `AgentEvent` stream fanned into UI + registry | no |
@@ -49,6 +52,31 @@ session tab, row navigation on Home. On top of that sit three layers (ADR-0009):
   breaking a spawn. Choices persist on the session row (registry schema v2) and
   show in the roster and the session status line.
 
+## The swarm plan and the Resources view (ADR-0010, ADR-0011)
+
+Milestone 2c adds workspace resource planning on top of the command plane:
+
+- **Roles** (`.swarm/swarm.json`, committed and shareable): named launch presets —
+  tool, model/effort (verbatim, no translation), purpose, startup commands. The
+  picker lists roles above the raw tools; selecting one spawns through the layer-2
+  launch path and then injects the declared startup commands, each gated on a
+  stable first paint and a type→verify-echo→Enter sequence so a character-swallowing
+  modal can never receive a blind Enter. Commands matching a `persists: true`
+  command-table entry pause for a y/n confirm (new in 2c — the attended palette
+  stays badge-only per ADR-0009). Roles are presets, not enforcement; the registry's
+  `role` column (schema v3) records what was requested. `core/plan.rs` validates
+  strictly (unknown/suspended tools, non-slash commands, versions) and a broken file
+  degrades to a one-line picker error, never a crash.
+- **Resources view** (prefix+`u`, Home tab body): one block per active vendor —
+  the plan's role assignments, the vendor's own usage screen captured VERBATIM, a
+  best-effort `%` headline, and a relative "as of Xm ago" timestamp. Refresh is
+  manual only (digit per vendor): it spawns a hidden, unregistered, short-lived
+  probe pane, injects the vendor's own `/usage` (same echo guard), snapshots the
+  vt100 grid, and kills the pane. No machine-readable usage surface exists on
+  either vendor (integration pages, 2026-07-16), so the tools' own words are the
+  interface — swarm-tui never parses or normalizes them (claude reports % used,
+  agy % available; normalizing would drift).
+
 ## Implementation status
 
 As of this milestone (Stages A1–E, 2026-07-15): the registry (`src/store/`), the
@@ -69,6 +97,12 @@ recorded design for the reversal path.
 palette, per-tool launch options, and registry schema v2 (`model`/`effort` columns
 with a real v1→v2 migration) are live — see "The command plane" above and
 ADR-0009.
+
+**Milestone 2c (the swarm plan) is implemented as of 2026-07-16:** the
+`.swarm/swarm.json` roles file with picker integration and startup-command
+injection, the prefix+`u` Resources view with hidden usage probes, and registry
+schema v3 (`role` column; v1 databases migrate through a v1→v2→v3 chain) — see
+"The swarm plan and the Resources view" above, ADR-0010, and ADR-0011.
 
 ## The two channels (ADR-0001)
 

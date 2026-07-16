@@ -19,15 +19,20 @@ workspace:
 
 ## Status
 
-**Milestone 2b (the command plane) is implemented as of 2026-07-16**, on top of
-the 2a shell (2026-07-15). `cargo run` boots a real, interactive terminal shell —
-tabs, a home roster, and live PTY sessions for Claude Code and Antigravity CLI
-(an active tool degrades to a greyed-out badge if its probe fails, never
-disappears), plus Claude Code background-agent reconciliation. New in 2b: a
-**command palette** (`Ctrl-Space` then `:` on a session tab) that injects each
-tool's verified native slash commands, and **launch options** — pick model (and
-effort, for claude) when spawning a session; the choice is stored on the session
-row and shown in the roster. Per-tool command facts live in
+**Milestone 2c (the swarm plan) is implemented as of 2026-07-16**, on top of the
+2b command plane (same day) and the 2a shell (2026-07-15). `cargo run` boots a
+real, interactive terminal shell — tabs, a home roster, and live PTY sessions for
+Claude Code and Antigravity CLI (an active tool degrades to a greyed-out badge if
+its probe fails, never disappears), plus Claude Code background-agent
+reconciliation, a **command palette** (`Ctrl-Space` then `:`), and **launch
+options** (model/effort on spawn, stored on the session row). New in 2c: a
+committed **`.swarm/swarm.json` roles file** — named launch presets the
+new-session picker lists above the raw tools, with startup commands injected
+after first paint ([ADR-0010](docs/adr/0010-swarm-plan-roles-file.md)) — and a
+**Resources view** (`Ctrl-Space` then `u`) showing each vendor's own usage screen,
+captured verbatim from a hidden probe pane on manual refresh
+([ADR-0011](docs/adr/0011-usage-view-probe-pane.md)). Per-tool command and usage
+facts live in
 [`docs/integrations/command-surfaces.md`](docs/integrations/command-surfaces.md). **Codex CLI is suspended as of 2026-07-16**
 ([ADR-0008](docs/adr/0008-suspend-codex-integration.md)): its adapter stays
 compiled for easy reversal, but it is never probed, offered, or spawned; historical
@@ -50,8 +55,36 @@ cargo run
 ```
 
 Boots straight into the Home tab. Press `Ctrl-Space` then `c` to open a new
-session tab for any installed tool (uninstalled tools are greyed out, not
-hidden). See the keymap below for everything else.
+session tab — the picker lists your workspace's **roles** first, then the raw
+tools (uninstalled tools are greyed out, not hidden). See the keymap below for
+everything else.
+
+### Roles (`.swarm/swarm.json`)
+
+Commit a roles file at the repo root and the picker turns it into one-keystroke
+launch presets. This repo dogfoods its own:
+
+```json
+{
+  "version": 1,
+  "roles": {
+    "researcher": { "tool": "antigravity", "model": "gemini-3.1-pro",
+                    "purpose": "web search & docs" },
+    "coder":      { "tool": "claude-code", "model": "opus-4.8", "effort": "high",
+                    "purpose": "implementation" },
+    "advisor":    { "tool": "claude-code", "model": "sonnet-5",
+                    "purpose": "general advisor",
+                    "startup_commands": ["/advisor fable"] }
+  }
+}
+```
+
+Model strings pass **verbatim** to the tool's `--model` (an invalid id is the
+tool's own in-pane error); `startup_commands` inject in order once the pane
+paints, and any command whose effect persists beyond the session asks for a y/n
+first. Missing file = no roles section; malformed file = a one-line error in the
+picker. Never put secrets in this file — no field accepts them. Details in
+[ADR-0010](docs/adr/0010-swarm-plan-roles-file.md).
 
 ## Keymap
 
@@ -62,11 +95,12 @@ Press **Ctrl-Space** to enter the one-shot command mode, then press one of:
 | `h` / `0` | Home |
 | `1`-`9` | Jump to tab N |
 | `n` / `p` | Cycle to next / previous tab |
-| `c` | New session (tool, then model/effort options) |
+| `c` | New session (roles, then tools; raw tools open a model/effort form) |
 | `:` | Command palette — inject a native slash command into the active session tab |
 | `d` | Detach |
 | `x` | Close tab (confirm) |
-| `r` | Refresh roster |
+| `r` | Refresh roster + reload `.swarm/swarm.json` |
+| `u` | Resources view — per-vendor usage (digit refreshes a vendor; Esc/`u` back) |
 | `?` | Keymap overlay |
 | `q` | Quit (confirm if any pane is alive; quitting kills remaining panes after confirmation) |
 

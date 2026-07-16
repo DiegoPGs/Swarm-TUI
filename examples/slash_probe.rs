@@ -6,16 +6,22 @@
 //! arrow keys, and snapshots every state to `target/slash-probe/`. Then Esc and
 //! kill — **nothing is ever submitted**.
 //!
-//! Ground rules (AGENTS.md + the milestone brief):
+//! Ground rules (AGENTS.md + the milestone briefs):
 //! - characters, arrows, backspace, and Esc only — never Enter at a prompt;
-//! - the single exception, authorized by the owner on 2026-07-16 and recorded
-//!   in `docs/NOTES.md`: answering agy's workspace-trust dialog once for this
+//! - exception 1 (2b, owner-authorized 2026-07-16, recorded in
+//!   `docs/NOTES.md`): answering agy's workspace-trust dialog once for this
 //!   repo dir (the dialog ignores character keys; Enter accepts the default
-//!   "Yes, I trust this folder", which persists one trusted-workspace entry).
+//!   "Yes, I trust this folder", which persists one trusted-workspace entry);
+//! - exception 2 (2c, owner-authorized 2026-07-16, recorded in
+//!   `docs/NOTES.md`): the `usage` mode below MAY submit exactly these
+//!   read-only display commands, nothing else, ever: `/usage` and `/status`
+//!   (claude), `/usage` and `/credits` (agy).
 //!
 //! ```sh
-//! cargo run --example slash_probe -- claude
+//! cargo run --example slash_probe -- claude          # menu observation (2b)
 //! cargo run --example slash_probe -- agy
+//! cargo run --example slash_probe -- claude usage    # usage screens (2c)
+//! cargo run --example slash_probe -- agy usage
 //! ```
 
 use std::error::Error;
@@ -81,13 +87,19 @@ const AGY_PROBES: &[&str] = &[
     "tasks",
 ];
 
+/// The `usage` mode's submit whitelists — exactly the four commands the owner
+/// authorized for submission (exception 2 in the header). Do not extend.
+const CLAUDE_USAGE_CMDS: &[&str] = &["/usage", "/status"];
+const AGY_USAGE_CMDS: &[&str] = &["/usage", "/credits"];
+
 fn main() {
     let target = std::env::args().nth(1).unwrap_or_default();
-    let (bin, probes): (&str, &[&str]) = match target.as_str() {
-        "claude" => ("claude", CLAUDE_PROBES),
-        "agy" => ("agy", AGY_PROBES),
+    let mode = std::env::args().nth(2).unwrap_or_default();
+    let (bin, probes, usage_cmds): (&str, &[&str], &[&str]) = match target.as_str() {
+        "claude" => ("claude", CLAUDE_PROBES, CLAUDE_USAGE_CMDS),
+        "agy" => ("agy", AGY_PROBES, AGY_USAGE_CMDS),
         _ => {
-            eprintln!("usage: cargo run --example slash_probe -- <claude|agy>");
+            eprintln!("usage: cargo run --example slash_probe -- <claude|agy> [usage]");
             std::process::exit(2);
         }
     };
@@ -97,7 +109,15 @@ fn main() {
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/slash-probe");
     std::fs::create_dir_all(&out_dir).expect("create snapshot dir");
 
-    match probe(bin, probes, &out_dir) {
+    let result = match mode.as_str() {
+        "" => probe(bin, probes, &out_dir),
+        "usage" => usage(bin, usage_cmds, &out_dir),
+        _ => {
+            eprintln!("usage: cargo run --example slash_probe -- <claude|agy> [usage]");
+            std::process::exit(2);
+        }
+    };
+    match result {
         Ok(()) => println!(
             "\nslash_probe {bin}: done — snapshots: {}",
             out_dir.display()
@@ -146,11 +166,12 @@ impl Probe {
         let _ = std::fs::write(path, contents);
     }
 
-    /// Wait for a stable, non-blank paint (Ink/agy animate while booting).
-    fn wait_boot(&mut self) -> Result<(), String> {
+    /// Wait for a stable, non-blank paint: contents identical across two
+    /// consecutive 400ms polls (Ink/agy animate while booting/fetching).
+    fn wait_stable(&mut self, cap: Duration) -> Result<(), String> {
         let start = Instant::now();
         let mut previous = String::new();
-        while start.elapsed() < Duration::from_secs(15) {
+        while start.elapsed() < cap {
             thread::sleep(Duration::from_millis(400));
             let now = self.contents();
             if !now.trim().is_empty() && now == previous {
@@ -158,7 +179,11 @@ impl Probe {
             }
             previous = now;
         }
-        Err("no stable paint within 15s".into())
+        Err(format!("no stable paint within {}s", cap.as_secs()))
+    }
+
+    fn wait_boot(&mut self) -> Result<(), String> {
+        self.wait_stable(Duration::from_secs(15))
     }
 }
 
@@ -169,7 +194,9 @@ impl Drop for Probe {
     }
 }
 
-fn probe(bin: &str, probes: &[&str], out_dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+/// Spawn the wrapped CLI in a PTY with the plain-terminal env, exactly like
+/// the fidelity spike / production panes.
+fn spawn_probe(bin: &str, out_dir: &std::path::Path) -> Result<Probe, Box<dyn Error>> {
     let pty = native_pty_system();
     let pair = pty.openpty(PtySize {
         rows: ROWS,
@@ -180,7 +207,6 @@ fn probe(bin: &str, probes: &[&str], out_dir: &std::path::Path) -> Result<(), Bo
 
     let mut cmd = CommandBuilder::new(bin);
     cmd.cwd(env!("CARGO_MANIFEST_DIR"));
-    // Plain-terminal env, exactly like the fidelity spike / production panes.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env_remove("CLAUDECODE");
@@ -203,7 +229,7 @@ fn probe(bin: &str, probes: &[&str], out_dir: &std::path::Path) -> Result<(), Bo
         }
     });
 
-    let mut p = Probe {
+    Ok(Probe {
         bytes,
         seen: 0,
         parser: vt100::Parser::new(ROWS, COLS, 0),
@@ -211,13 +237,15 @@ fn probe(bin: &str, probes: &[&str], out_dir: &std::path::Path) -> Result<(), Bo
         child,
         out_dir: out_dir.to_path_buf(),
         bin: bin.to_string(),
-    };
+    })
+}
 
+/// Boot to a stable paint and, agy only, answer the workspace-trust dialog
+/// (exception 1 — accepting the default "Yes, I trust this folder").
+fn boot_and_trust(p: &mut Probe, bin: &str) -> Result<(), Box<dyn Error>> {
     p.wait_boot().map_err(|e| format!("{bin} boot: {e}"))?;
     p.snapshot("00-boot");
 
-    // agy only: the one authorized Enter — accept the workspace-trust dialog
-    // (default selection "Yes, I trust this folder") if it is showing.
     if p.contents().contains("Do you trust") {
         println!("  {bin}: workspace-trust dialog present — accepting (owner-authorized)");
         p.send(b"\r")?;
@@ -225,6 +253,12 @@ fn probe(bin: &str, probes: &[&str], out_dir: &std::path::Path) -> Result<(), Bo
             .map_err(|e| format!("{bin} post-trust boot: {e}"))?;
         p.snapshot("01-post-trust");
     }
+    Ok(())
+}
+
+fn probe(bin: &str, probes: &[&str], out_dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let mut p = spawn_probe(bin, out_dir)?;
+    boot_and_trust(&mut p, bin)?;
 
     // Open the native command menu and capture the unfiltered view, then walk
     // downward to expose later pages (arrow keys navigate, never select).
@@ -260,5 +294,43 @@ fn probe(bin: &str, probes: &[&str], out_dir: &std::path::Path) -> Result<(), Bo
     p.settle(200);
     p.snapshot("99-final");
     println!("  {bin}: {} probes captured", probes.len());
+    Ok(())
+}
+
+/// Milestone 2c stage 1 — capture the tools' own usage/quota screens by
+/// submitting the whitelisted display commands (exception 2 in the header;
+/// every submission is printed so the run log records it). Snapshots are for
+/// deriving SYNTHETIC fixtures only — real captures are never committed.
+fn usage(bin: &str, commands: &[&str], out_dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let mut p = spawn_probe(bin, out_dir)?;
+    boot_and_trust(&mut p, bin)?;
+
+    for cmd in commands {
+        let name = cmd.trim_start_matches('/');
+        p.send(cmd.as_bytes())?;
+        p.settle(450);
+        p.snapshot(&format!("20-{name}-typed"));
+
+        println!("  {bin}: submitting {cmd} (owner-authorized usage-surface exception)");
+        p.send(b"\r")?;
+        // Usage pages fetch live quota data; give the redraw a head start,
+        // then wait for a stable paint before capturing.
+        p.settle(1500);
+        p.wait_stable(Duration::from_secs(20))
+            .map_err(|e| format!("{bin} {cmd}: {e}"))?;
+        p.snapshot(&format!("21-{name}-screen"));
+
+        // Dismiss any full-screen panel, then clear leftover prompt text.
+        p.send(ESC)?;
+        p.settle(300);
+        for _ in 0..(cmd.len() + 2) {
+            p.send(BACKSPACE)?;
+            thread::sleep(Duration::from_millis(20));
+        }
+        p.settle(200);
+    }
+
+    p.snapshot("99-usage-final");
+    println!("  {bin}: {} usage screens captured", commands.len());
     Ok(())
 }
