@@ -7,11 +7,13 @@ facts are sourced in `docs/integrations/`. This page describes how the pieces fi
 
 A single Rust binary presenting a tabbed terminal UI. One tab is the **home view**
 (cross-agent roster, dispatch, broadcast). Every other tab is a **live interactive
-session** of one underlying CLI — the real `claude`, `agy`, or `codex` process running
-in a PTY that swarm-tui owns and renders. Between the UI and the tools sits one trait,
-`CliAdapter`, with three implementations. Underneath everything is a thin SQLite
-registry that remembers which native session ID lives behind which tab, so work can move
-between headless dispatch and interactive attention without losing the thread.
+session** of one underlying CLI — the real `claude` or `agy` process running in a PTY
+that swarm-tui owns and renders (the `codex` integration is suspended — ADR-0008).
+Between the UI and the tools sits one trait, `CliAdapter`, with one implementation
+per tool (two active, one suspended-but-compiled). Underneath everything is a thin
+SQLite registry that remembers which native session ID lives behind which tab, so
+work can move between headless dispatch and interactive attention without losing the
+thread.
 
 ## Components
 
@@ -35,6 +37,13 @@ PTY layer (`src/pty/`), the app shell (`src/app/`), and Claude Code reconciliati
 terminal shell with tabs, a home roster, and live PTY sessions. `CliAdapter::
 dispatch()`/`follow_up()` (headless dispatch), broadcast, pipelines, and MCP
 integration are still not implemented — deferred to a later milestone.
+
+**Codex CLI is suspended as of 2026-07-16 (ADR-0008):** its adapter stays compiled
+(enum variant, module, dispatch arms all intact) but `registry()` no longer lists
+it, so it is never probed, offered in the new-session picker, or spawned. Historical
+`tool = "codex"` registry rows render read-only in the roster. Codex mentions
+elsewhere on this page (channel tables, guardrail defaults, failure modes) remain as
+recorded design for the reversal path.
 
 ## The two channels (ADR-0001)
 

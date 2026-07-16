@@ -1,5 +1,13 @@
 # Integration: Codex CLI (`codex`)
 
+> **⏸ SUSPENDED (ADR-0008, 2026-07-16).** Codex is out of swarm-tui's active scope:
+> `registry()` no longer lists it, so it is never probed, offered in the new-session
+> picker, or spawned. The adapter module, `AdapterKind::Codex`, and this page stay —
+> historical `tool = "codex"` registry rows still render read-only in the Home
+> roster. Reversal = restore the registry entry and run the recipe in
+> [`docs/adr/0008-suspend-codex-integration.md`](../adr/0008-suspend-codex-integration.md).
+> The facts below are frozen at the dates recorded.
+
 Verified 2026-07-04 against developers.openai.com/codex (official reference, features,
 non-interactive pages), npm latest **0.142.5**. ✅ = official docs; 🔶 = reputable
 secondary / upstream issue tracker; ⬜ = **verify locally**.

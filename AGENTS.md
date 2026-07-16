@@ -1,11 +1,13 @@
 # swarm-tui
 
-Terminal orchestrator (Rust, ratatui) that wraps the locally installed Claude Code,
-Antigravity CLI (`agy`), and Codex CLI: per-service interactive session tabs plus a home
-view that routes cross-agent work. Maturity: **early implementation** — docs, module
-stubs compiling against the pinned deps, and a passed ADR-0003 fidelity spike
-(2026-07-05); no runnable orchestration logic yet. The single thing an agent must never break: **swarm-tui reuses the
-three CLIs' existing local logins and config; it must never trigger a new auth flow or
+Terminal orchestrator (Rust, ratatui) that wraps the locally installed Claude Code
+and Antigravity CLI (`agy`): per-service interactive session tabs plus a home view
+that routes cross-agent work. The Codex CLI integration is **suspended**
+(ADR-0008) — its adapter stays compiled for reversal but is never probed, offered,
+or spawned. Maturity: **early implementation** — the milestone-2a shell is real
+(`cargo run` boots tabs, roster, and live PTY sessions); no headless orchestration
+logic yet. The single thing an agent must never break: **swarm-tui reuses the
+wrapped CLIs' existing local logins and config; it must never trigger a new auth flow or
 read, print, or copy the contents of any credential file** (`~/.codex/auth.json`,
 anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that these paths
 *exist* is fine; their contents are off-limits.

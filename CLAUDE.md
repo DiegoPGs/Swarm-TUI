@@ -31,9 +31,11 @@ MAINTENANCE
 integration-page updates, the ADR divergence review (nothing needed superseding),
 dependency enablement, and the ADR-0003 fidelity spike (**passed** — the pane layer
 stays on `vt100` + `tui-term`) are all recorded in `docs/NOTES.md`. One gap remains:
-**Codex CLI is not installed on this machine.** After the owner installs it, re-run
-`./scripts/verify-clis.sh`, settle the ⬜ items in `docs/integrations/codex.md`, and
-re-run `cargo run --example fidelity_spike`.
+**Codex CLI is not installed on this machine.** The integration is now formally
+**suspended** (ADR-0008, 2026-07-16); after the owner installs codex, the reversal
+recipe is: restore the `registry()` entry, re-run `./scripts/verify-clis.sh`, settle
+the ⬜ items in `docs/integrations/codex.md`, and re-run
+`cargo run --example fidelity_spike`.
 
 **Working style in this repo:** use plan mode for any change under `src/adapters/` or
 to the `CliAdapter` trait; those are the contract surfaces. Background/long tasks are
