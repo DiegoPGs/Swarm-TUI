@@ -36,12 +36,15 @@ const PREFIX: &[u8] = &[0x00]; // Ctrl-Space over a PTY is a NUL byte
 const TYPED: &str = "hello swarm";
 
 fn main() {
-    let bin = PathBuf::from("target/debug/swarm-tui");
+    // Anchor on the crate root so a stray shell cwd can't relocate snapshots
+    // or change the directory the shell (and its wrapped CLIs) runs in.
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bin = repo_root.join("target/debug/swarm-tui");
     if !bin.exists() {
         eprintln!("missing {}: run `cargo build` first", bin.display());
         std::process::exit(2);
     }
-    let out_dir = PathBuf::from("target/shell-smoke");
+    let out_dir = repo_root.join("target/shell-smoke");
     std::fs::create_dir_all(&out_dir).expect("create snapshot dir");
 
     match smoke(&bin, &out_dir) {
@@ -132,7 +135,7 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     })?;
 
     let mut cmd = CommandBuilder::new(bin.canonicalize()?);
-    cmd.cwd(std::env::current_dir()?);
+    cmd.cwd(env!("CARGO_MANIFEST_DIR"));
     // Same plain-terminal env as production panes/fidelity spike, plus the
     // data-dir override that keeps this run off the real registry.
     cmd.env("TERM", "xterm-256color");
