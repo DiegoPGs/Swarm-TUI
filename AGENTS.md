@@ -65,9 +65,9 @@ anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that the
 
 ## Gotchas
 
-- `agy -p` has **no structured-output flag** (confirmed locally at v1.0.14,
-  2026-07-05) — the Antigravity programmatic channel is plain text; don't assume JSON
-  parity with the other two.
+- `agy -p` has **no structured-output flag** (confirmed locally at v1.0.14
+  2026-07-05 and v1.1.3 2026-07-16) — the Antigravity programmatic channel is plain
+  text; don't assume JSON parity with Claude Code.
 - `claude -p --resume <id>` resolves session IDs **scoped to the current project
   directory and its worktrees** — dispatch and resume must run from the same cwd.
 - `claude --bare` skips OAuth/keychain reads and needs an API key — it breaks the

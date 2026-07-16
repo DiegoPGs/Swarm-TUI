@@ -79,6 +79,16 @@ slash-command surface at this version lives in `command-surfaces.md`.
   `--allowedTools` / `--disallowedTools` / `--tools`, `--max-turns`,
   `--max-budget-usd <amount>` (print mode), `--permission-prompt-tool <mcp-tool>` for
   programmatic approval handling (a v2 option for surfacing approvals in the home view).
+  ✅ *(local 2026-07-16)* At 2.1.211 the `--help` choices are `acceptEdits, auto,
+  bypassPermissions, manual, dontAsk, plan` — **`default` has become `manual`**.
+
+## Launch options (interactive — milestone 2b)
+
+- ✅ *(local 2026-07-16)* `--model <model>` — "Model for the current session";
+  aliases `fable`, `opus`, `sonnet`, or a full model name (`claude-fable-5`).
+- ✅ *(local 2026-07-16)* `--effort <level>` — `low, medium, high, xhigh, max`.
+- The in-TUI slash-command surface at 2.1.211 (incl. `/model` and `/effort`
+  persistence semantics) lives in [`command-surfaces.md`](command-surfaces.md).
 
 ## MCP posture
 

@@ -257,3 +257,34 @@ on an **interactive fresh spawn** at 2.1.211 — stamped in
 **Open-⬜ review (read-only pass):** `claude-code.md` had no open ⬜ items.
 `antigravity.md`'s three ⬜ items all require a live headless dispatch ("run
 supervised") and stay open by design this milestone.
+
+## Milestone 2b — Stage 2: command-surface research (2026-07-16)
+
+Produced `docs/integrations/command-surfaces.md`: the claude 2.1.211 and agy 1.1.3
+slash-command tables (with persistence flags), launch-flag facts, and the
+cross-tool concept map. Method: official docs (code.claude.com/docs/en/commands;
+`agy changelog` release notes) plus local observation via the new
+`examples/slash_probe.rs` — each TUI booted in a PTY, "/" typed, the autocomplete
+menu walked/filtered and vt100-snapshotted, then Esc + kill. Characters, arrows,
+backspace, Esc only; nothing submitted. Headlines: **/advisor is real** (menu +
+docs, ≥2.1.170); **/rename exists locally but not on the official page**; agy
+**/goal and /schedule are real at 1.1.3**; `/resume` carries both `/switch` and
+`/conversation` aliases; agy grew `--agent`/`--mode` since v1.0.14 and still has no
+structured-output flag.
+
+**Workspace-trust authorization (owner-granted 2026-07-16, in-chat).** Reaching
+agy's prompt required answering its workspace-trust dialog — normally forbidden
+twice over (Enter in a real pane; persisting agy config). The owner authorized
+answering it **once for this repo dir**. Execution note, in the interest of full
+disclosure: the first probe run inherited a stale shell cwd and opened agy in
+`target/slash-probe/`, so the accept landed on that subdirectory — an accidental
+extra trusted-workspace entry in agy's state (contents identical to the repo; the
+owner can prune it via agy `/config` if desired). The harness was then hardened to
+anchor on `CARGO_MANIFEST_DIR` (cwd can no longer leak into probe runs) and re-run
+from the repo root, where the authorized accept was performed. Net agy state
+change: two trusted-workspace entries (repo root — intended; `target/slash-probe`
+— accidental, disclosed).
+
+**Fidelity-spike follow-up:** with the repo now trusted, agy boots to its prompt,
+so the spike's "echo of typed chars" check passes again at 1.1.3 (the stage-0
+DEFECT line was the trust dialog swallowing chars, as recorded above).
