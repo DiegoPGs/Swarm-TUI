@@ -340,3 +340,23 @@ agy `--model` accepted argument format (supervised one-liner recorded); agy
 persistence nuance (owner-reported 🔶 vs. undistinguishing official docs); the
 three pre-existing agy live-dispatch items; everything codex (suspended,
 ADR-0008).
+
+## Milestone 2c — Stage 0: local validation (2026-07-16)
+
+**Gates: all green.** `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo check`, `cargo test` (54/54), and `cargo run --example
+fidelity_spike` all pass on the target machine. Installed versions this session:
+`claude` **2.1.211**, `agy` **1.1.3** (both unchanged since the 2b pass earlier
+today), codex still absent.
+
+**CI: green on main.** Two successful runs since the last entry —
+`29512367507` (push to main, 2026-07-16, the milestone-2b merge of PR #3) and the
+PR #3 run itself. Nothing needed enabling.
+
+**Fidelity spike re-run — ADR-0003 verdict unchanged.** claude: 800 ms to stable
+paint, the known 1-differing-line cursor-cell artifact (explained in the 2b
+Stage 0 entry). agy: 2802 ms to stable paint and — new since 2b — **"echo of
+typed chars: OK"**: the repo dir is now a trusted agy workspace (the 2b
+owner-authorized trust accept), so agy boots straight to its prompt instead of
+the char-swallowing trust dialog. Same 1-line cursor artifact. No doc change
+needed; ADR-0003 stands.
