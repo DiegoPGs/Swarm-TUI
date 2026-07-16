@@ -132,4 +132,36 @@ mod tests {
             b"/model opus\r".to_vec()
         );
     }
+
+    /// End-to-end injection against a fake pane (`sh -c cat` — no wrapped CLI
+    /// anywhere near this test): the exact bytes must arrive and echo.
+    #[test]
+    fn injected_bytes_arrive_in_a_fake_cat_pane() {
+        use crate::pty::local::LocalPaneHost;
+        use crate::pty::{PaneHost, PaneSize};
+        use std::time::{Duration, Instant};
+
+        let (mut host, _rx) = LocalPaneHost::new();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("cat");
+        let pane = host.spawn(cmd, PaneSize { rows: 24, cols: 80 }).unwrap();
+
+        host.write_input(pane, &injection_bytes(&TABLE[0], Some("opus")))
+            .unwrap();
+
+        let start = Instant::now();
+        let mut seen = String::new();
+        while start.elapsed() < Duration::from_secs(2) {
+            seen = host.with_screen(pane, |s| s.contents()).unwrap();
+            if seen.contains("/model opus") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            seen.contains("/model opus"),
+            "pane never echoed the injected command; screen:\n{seen}"
+        );
+        host.kill(pane).unwrap();
+    }
 }

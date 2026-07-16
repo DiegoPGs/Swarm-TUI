@@ -1218,3 +1218,159 @@ pub async fn run(config: SwarmTuiConfig) -> Result<(), AppError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::LaunchOptionsDecl;
+
+    #[test]
+    fn build_launch_options_maps_empty_fields_to_none() {
+        const LEVELS: &[&str] = &["low", "high"];
+        let decl = LaunchOptionsDecl {
+            model: Some(&[]),
+            effort: Some(LEVELS),
+        };
+        // Nothing chosen → nothing sent.
+        let opts = build_launch_options("", 0, &decl);
+        assert_eq!(opts, adapters::LaunchOptions::default());
+        // Whitespace is not a model.
+        assert_eq!(build_launch_options("   ", 0, &decl).model, None);
+        // Chosen values map through (effort_idx is 1-based over the decl).
+        let opts = build_launch_options("  opus ", 2, &decl);
+        assert_eq!(opts.model.as_deref(), Some("opus"));
+        assert_eq!(opts.effort.as_deref(), Some("high"));
+        // Undeclared fields never materialize, whatever the form held.
+        let opts = build_launch_options("opus", 1, &LaunchOptionsDecl::NONE);
+        assert_eq!(opts, adapters::LaunchOptions::default());
+    }
+
+    // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
+
+    fn test_record(id: u64, tool: &str) -> SessionRecord {
+        SessionRecord {
+            id,
+            tool: tool.to_string(),
+            native_id: None,
+            name: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: SessionMode::Interactive,
+            status: SessionStatus::Running,
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+            cost_usd: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// An `App` with one registered session backed by a fake `sh -c cat`
+    /// pane. Session id 1; the session tab is NOT promoted (tests do that).
+    fn app_with_cat_pane(tool: &str) -> (App, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = Registry::open(&tmp.path().join("registry.db")).expect("open registry");
+        // Dropping the change-notification receiver is fine: reader threads
+        // send best-effort (`let _ =`) and nothing here polls redraws.
+        let (mut pane_host, _pane_changed_rx) = LocalPaneHost::new();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("cat");
+        let pane_id = pane_host
+            .spawn(cmd, PaneSize { rows: 24, cols: 80 })
+            .expect("spawn fake pane");
+
+        let record = test_record(1, tool);
+        let app = App {
+            tabs: Tabs::new(),
+            registry,
+            pane_host,
+            pane_of_session: HashMap::from([(1, pane_id)]),
+            home: HomeView::new(vec![RosterEntry::Registered(record)]),
+            input_mode: InputMode::Normal,
+            probe_cache: HashMap::new(),
+            pending_confirm: None,
+            new_session_picker: None,
+            palette: None,
+            show_keymap_overlay: false,
+            pane_area_size: PaneSize { rows: 24, cols: 80 },
+        };
+        (app, tmp)
+    }
+
+    #[test]
+    fn colon_opens_palette_only_for_live_session_tab() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+
+        // Home tab active → no-op.
+        app.open_palette();
+        assert!(app.palette.is_none());
+
+        // Session tab with a live pane and a known tool → opens.
+        app.tabs.promote(1);
+        app.open_palette();
+        let pal = app.palette.as_ref().expect("palette should open");
+        assert_eq!(
+            pal.entries.len(),
+            AdapterKind::ClaudeCode.command_table().len()
+        );
+        app.palette = None;
+
+        // Unknown tool slug → no-op (from_slug fails; nothing to list).
+        let (mut alien, _tmp2) = app_with_cat_pane("mystery-tool");
+        alien.tabs.promote(1);
+        alien.open_palette();
+        assert!(alien.palette.is_none());
+
+        // Exited pane → no-op.
+        let pane_id = app.pane_of_session[&1];
+        app.pane_host.kill(pane_id).expect("kill fake pane");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.pane_host.is_exited(pane_id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.open_palette();
+        assert!(app.palette.is_none());
+    }
+
+    #[tokio::test]
+    async fn palette_enter_injects_the_selected_command_into_the_pane() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        app.tabs.promote(1);
+
+        let press = |code: KeyCode, mods: KeyModifiers| KeyEvent::new(code, mods);
+
+        // Prefix, then ':' opens the palette on the session tab.
+        app.handle_key(press(KeyCode::Char(' '), KeyModifiers::CONTROL))
+            .await;
+        app.handle_key(press(KeyCode::Char(':'), KeyModifiers::NONE))
+            .await;
+        assert!(app.palette.is_some());
+
+        // Filter down to /status (no args_hint → Enter injects directly).
+        for c in "status".chars() {
+            app.handle_key(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .await;
+        }
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert!(app.palette.is_none(), "palette closes after injecting");
+
+        // The fake pane must have received and echoed "/status" + CR.
+        let pane_id = app.pane_of_session[&1];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            seen = app
+                .pane_host
+                .with_screen(pane_id, |s| s.contents())
+                .expect("screen");
+            if seen.contains("/status") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            seen.contains("/status"),
+            "injected command never reached the pane; screen:\n{seen}"
+        );
+    }
+}

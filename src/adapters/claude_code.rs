@@ -395,3 +395,69 @@ impl ClaudeCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn opts(model: Option<&str>, effort: Option<&str>) -> LaunchOptions {
+        LaunchOptions {
+            model: model.map(String::from),
+            effort: effort.map(String::from),
+        }
+    }
+
+    #[test]
+    fn fresh_with_hint_still_maps_to_session_id() {
+        let intent = LaunchIntent::Fresh {
+            session_id_hint: Some("abc-123".to_string()),
+        };
+        let cmd = ClaudeCode.interactive_cmd(&intent, &LaunchOptions::default(), Path::new("/tmp"));
+        assert_eq!(cmd.get_program(), "claude");
+        assert_eq!(argv(&cmd), ["--session-id", "abc-123"]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn default_options_add_no_flags() {
+        let intent = LaunchIntent::Fresh {
+            session_id_hint: None,
+        };
+        let cmd = ClaudeCode.interactive_cmd(&intent, &LaunchOptions::default(), Path::new("/tmp"));
+        assert!(argv(&cmd).is_empty());
+    }
+
+    #[test]
+    fn model_and_effort_append_for_every_intent() {
+        let o = opts(Some("opus"), Some("high"));
+        let cases: [(LaunchIntent, &[&str]); 3] = [
+            (
+                LaunchIntent::Fresh {
+                    session_id_hint: Some("abc".to_string()),
+                },
+                &["--session-id", "abc", "--model", "opus", "--effort", "high"],
+            ),
+            (
+                LaunchIntent::Resume {
+                    native_id: "xyz".to_string(),
+                },
+                &["--resume", "xyz", "--model", "opus", "--effort", "high"],
+            ),
+            (
+                LaunchIntent::ContinueMostRecent,
+                &["--continue", "--model", "opus", "--effort", "high"],
+            ),
+        ];
+        for (intent, expected) in cases {
+            let cmd = ClaudeCode.interactive_cmd(&intent, &o, Path::new("/tmp"));
+            assert_eq!(argv(&cmd), expected);
+        }
+    }
+}

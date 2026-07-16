@@ -303,3 +303,63 @@ impl CliAdapter for Antigravity {
         todo!("headless follow-up via agy --conversation (ADR-0001/0002)")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn model_maps_to_model_flag() {
+        let intent = LaunchIntent::Fresh {
+            session_id_hint: Some("ignored-by-agy".to_string()),
+        };
+        let opts = LaunchOptions {
+            model: Some("Gemini 3.1 Pro (High)".to_string()),
+            effort: None,
+        };
+        let cmd = Antigravity.interactive_cmd(&intent, &opts, Path::new("/tmp"));
+        assert_eq!(cmd.get_program(), "agy");
+        assert_eq!(argv(&cmd), ["--model", "Gemini 3.1 Pro (High)"]);
+    }
+
+    #[test]
+    fn effort_is_silently_ignored() {
+        let intent = LaunchIntent::Fresh {
+            session_id_hint: None,
+        };
+        let opts = LaunchOptions {
+            model: None,
+            effort: Some("high".to_string()),
+        };
+        let cmd = Antigravity.interactive_cmd(&intent, &opts, Path::new("/tmp"));
+        assert!(argv(&cmd).is_empty(), "agy has no effort flag to map");
+    }
+
+    #[test]
+    fn resume_still_uses_conversation_flag_with_options_appended() {
+        let intent = LaunchIntent::Resume {
+            native_id: "conv-1".to_string(),
+        };
+        let opts = LaunchOptions {
+            model: Some("Claude Opus 4.6 (Thinking)".to_string()),
+            effort: None,
+        };
+        let cmd = Antigravity.interactive_cmd(&intent, &opts, Path::new("/tmp"));
+        assert_eq!(
+            argv(&cmd),
+            [
+                "--conversation",
+                "conv-1",
+                "--model",
+                "Claude Opus 4.6 (Thinking)"
+            ]
+        );
+    }
+}

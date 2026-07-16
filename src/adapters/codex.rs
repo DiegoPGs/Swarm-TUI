@@ -124,3 +124,28 @@ impl CliAdapter for Codex {
         todo!("headless follow-up via codex exec resume (ADR-0001)")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn launch_options_are_ignored_entirely() {
+        let intent = LaunchIntent::Resume {
+            native_id: "tid-9".to_string(),
+        };
+        let opts = LaunchOptions {
+            model: Some("o5".to_string()),
+            effort: Some("max".to_string()),
+        };
+        let cmd = Codex.interactive_cmd(&intent, &opts, Path::new("/tmp"));
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Suspended (ADR-0008) and flagless for model/effort (codex.md):
+        // options must leave the argv untouched.
+        assert_eq!(argv, ["resume", "tid-9"]);
+    }
+}

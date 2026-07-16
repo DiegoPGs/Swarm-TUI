@@ -316,6 +316,7 @@ pub(crate) fn help_text(binary: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn registry_excludes_codex_while_suspended() {
@@ -326,5 +327,93 @@ mod tests {
         // Reversal path (ADR-0008): the slug stays resolvable so historical
         // registry rows keep mapping to the compiled-but-suspended adapter.
         assert_eq!(AdapterKind::from_slug("codex"), Some(AdapterKind::Codex));
+    }
+
+    fn all_tables() -> Vec<(&'static str, &'static [NativeCommand])> {
+        vec![
+            ("claude-code", AdapterKind::ClaudeCode.command_table()),
+            ("antigravity", AdapterKind::Antigravity.command_table()),
+            ("codex", AdapterKind::Codex.command_table()),
+        ]
+    }
+
+    #[test]
+    fn command_tables_inject_start_with_slash() {
+        for (tool, table) in all_tables() {
+            for entry in table {
+                assert!(
+                    entry.name.starts_with('/') && entry.inject.starts_with('/'),
+                    "{tool}: entry {:?} must name/inject a slash command",
+                    entry.name
+                );
+                assert!(
+                    !entry.description.is_empty(),
+                    "{tool}: {} has an empty description",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_table_names_are_unique_per_tool() {
+        for (tool, table) in all_tables() {
+            let unique: HashSet<&str> = table.iter().map(|e| e.name).collect();
+            assert_eq!(unique.len(), table.len(), "{tool}: duplicate entry names");
+        }
+    }
+
+    /// Pins the load-bearing `AdapterKind::command_table` dispatch override —
+    /// if it were dropped, enum-dispatched calls would silently return the
+    /// trait default `&[]` and every palette would render empty.
+    #[test]
+    fn claude_and_agy_command_tables_populated() {
+        assert!(!AdapterKind::ClaudeCode.command_table().is_empty());
+        assert!(!AdapterKind::Antigravity.command_table().is_empty());
+    }
+
+    #[test]
+    fn codex_command_table_is_empty_while_suspended() {
+        // ADR-0008/0009: nothing codex is locally verifiable, so its table
+        // stays the trait default until reversal.
+        assert!(AdapterKind::Codex.command_table().is_empty());
+    }
+
+    /// The `persists` flags are copies of the ✅-verified "Persists" column in
+    /// docs/integrations/command-surfaces.md (claude 2.1.211 / agy 1.1.3,
+    /// 2026-07-16) — that doc is the single source of truth; update it first,
+    /// then these sets, then the tables.
+    #[test]
+    fn persists_flags_match_command_surfaces_doc() {
+        let expected: [(&str, &[&str]); 2] = [
+            (
+                "claude-code",
+                &[
+                    "/model",
+                    "/effort",
+                    "/permissions",
+                    "/memory",
+                    "/keybindings",
+                    "/config",
+                ],
+            ),
+            (
+                "antigravity",
+                &["/model", "/permissions", "/config", "/keybindings"],
+            ),
+        ];
+        for (tool, expected_persistent) in expected {
+            let kind = AdapterKind::from_slug(tool).unwrap();
+            let mut actual: Vec<&str> = kind
+                .command_table()
+                .iter()
+                .filter(|e| e.persists)
+                .map(|e| e.name)
+                .collect();
+            actual.sort_unstable();
+            let mut expected_sorted = expected_persistent.to_vec();
+            expected_sorted.sort_unstable();
+            assert_eq!(actual, expected_sorted, "{tool}: persists flags drifted");
+        }
     }
 }
