@@ -19,7 +19,9 @@ use rusqlite::{params, Connection};
 
 use crate::core::session::{SessionMode, SessionRecord, SessionStatus};
 
-/// Schema v1.
+/// Schema v2 (v1 + `model`/`effort` launch options, ADR-0009). The new
+/// columns come **last** in the CREATE so fresh-v2 and migrated-v1 databases
+/// have identical column order.
 ///
 /// Note: docs/adr/0002-session-model-thin-registry.md's prose calls the
 /// timestamp/cost columns `last_activity`/`last_cost_usd`, but
@@ -33,7 +35,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT NOT NULL,
     mode TEXT NOT NULL CHECK (mode IN ('interactive','headless')),
     status TEXT NOT NULL CHECK (status IN ('running','completed','failed','orphaned')),
-    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, cost_usd REAL
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, cost_usd REAL,
+    model TEXT, effort TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_tool_native ON sessions(tool, native_id);
 -- Unused this milestone (dispatch()/follow_up() adapter methods stay todo!() elsewhere
@@ -43,6 +46,19 @@ CREATE TABLE IF NOT EXISTS dispatches (
     tool TEXT NOT NULL, prompt TEXT NOT NULL, cwd TEXT NOT NULL,
     started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT, cost_usd REAL
 );
+";
+
+const SCHEMA_VERSION: i64 = 2;
+
+/// v1 → v2: additive columns only, one transaction. A v1 database opened by
+/// this build hits the `CREATE TABLE IF NOT EXISTS` no-op above (its
+/// `sessions` lacks the new columns), so the ALTERs below supply them.
+const MIGRATE_V1_TO_V2: &str = "
+BEGIN;
+ALTER TABLE sessions ADD COLUMN model TEXT;
+ALTER TABLE sessions ADD COLUMN effort TEXT;
+UPDATE schema_version SET version = 2;
+COMMIT;
 ";
 
 pub struct Registry {
@@ -61,12 +77,32 @@ impl Registry {
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| StoreError::Open(e.to_string()))?;
 
-        let version_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+        // MAX over an empty table is NULL → None = a database this build just
+        // created (the batch above made v2 tables directly).
+        let version: Option<i64> = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| StoreError::Open(e.to_string()))?;
-        if version_count == 0 {
-            conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])
+        match version {
+            None => {
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    [SCHEMA_VERSION],
+                )
                 .map_err(|e| StoreError::Open(e.to_string()))?;
+            }
+            Some(1) => {
+                conn.execute_batch(MIGRATE_V1_TO_V2)
+                    .map_err(|e| StoreError::Open(format!("v1→v2 migration failed: {e}")))?;
+            }
+            Some(SCHEMA_VERSION) => {}
+            Some(newer) => {
+                return Err(StoreError::Open(format!(
+                    "registry schema v{newer} is newer than this build supports \
+                     (max v{SCHEMA_VERSION}) — refusing to open"
+                )));
+            }
         }
 
         Ok(Registry { conn })
@@ -93,8 +129,9 @@ impl Registry {
         self.conn
             .execute(
                 "INSERT INTO sessions
-                    (id, tool, native_id, name, cwd, mode, status, created_at, updated_at, cost_usd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    (id, tool, native_id, name, cwd, mode, status, created_at, updated_at,
+                     cost_usd, model, effort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(id) DO UPDATE SET
                     tool=excluded.tool,
                     native_id=excluded.native_id,
@@ -103,7 +140,9 @@ impl Registry {
                     mode=excluded.mode,
                     status=excluded.status,
                     updated_at=excluded.updated_at,
-                    cost_usd=excluded.cost_usd",
+                    cost_usd=excluded.cost_usd,
+                    model=excluded.model,
+                    effort=excluded.effort",
                 params![
                     record.id as i64,
                     record.tool,
@@ -115,6 +154,8 @@ impl Registry {
                     system_time_to_unix(record.created_at),
                     system_time_to_unix(record.updated_at),
                     record.cost_usd,
+                    record.model,
+                    record.effort,
                 ],
             )
             .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -125,7 +166,8 @@ impl Registry {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tool, native_id, name, cwd, mode, status, created_at, updated_at, cost_usd
+                "SELECT id, tool, native_id, name, cwd, mode, status, created_at, updated_at,
+                        cost_usd, model, effort
                  FROM sessions ORDER BY updated_at DESC",
             )
             .map_err(|e| StoreError::Query(e.to_string()))?;
@@ -142,16 +184,31 @@ impl Registry {
                 let created_at: i64 = row.get(7)?;
                 let updated_at: i64 = row.get(8)?;
                 let cost_usd: Option<f64> = row.get(9)?;
+                let model: Option<String> = row.get(10)?;
+                let effort: Option<String> = row.get(11)?;
                 Ok((
                     id, tool, native_id, name, cwd, mode, status, created_at, updated_at, cost_usd,
+                    model, effort,
                 ))
             })
             .map_err(|e| StoreError::Query(e.to_string()))?;
 
         let mut records = Vec::new();
         for row in rows {
-            let (id, tool, native_id, name, cwd, mode, status, created_at, updated_at, cost_usd) =
-                row.map_err(|e| StoreError::Query(e.to_string()))?;
+            let (
+                id,
+                tool,
+                native_id,
+                name,
+                cwd,
+                mode,
+                status,
+                created_at,
+                updated_at,
+                cost_usd,
+                model,
+                effort,
+            ) = row.map_err(|e| StoreError::Query(e.to_string()))?;
             records.push(SessionRecord {
                 id: id as u64,
                 tool,
@@ -163,6 +220,8 @@ impl Registry {
                 created_at: unix_to_system_time(created_at),
                 updated_at: unix_to_system_time(updated_at),
                 cost_usd,
+                model,
+                effort,
             });
         }
         Ok(records)
@@ -252,7 +311,132 @@ mod tests {
             created_at: UNIX_EPOCH + Duration::from_secs(1_000),
             updated_at: UNIX_EPOCH + Duration::from_secs(2_000),
             cost_usd: None,
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
         }
+    }
+
+    /// The v1 schema + version stamp, verbatim as shipped in milestone 2a —
+    /// used to build a genuine v1 database on disk for migration tests. Keep
+    /// frozen; it intentionally does NOT track `SCHEMA_SQL`.
+    const V1_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY, tool TEXT NOT NULL, native_id TEXT, name TEXT,
+    cwd TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('interactive','headless')),
+    status TEXT NOT NULL CHECK (status IN ('running','completed','failed','orphaned')),
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, cost_usd REAL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_tool_native ON sessions(tool, native_id);
+CREATE TABLE IF NOT EXISTS dispatches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER REFERENCES sessions(id),
+    tool TEXT NOT NULL, prompt TEXT NOT NULL, cwd TEXT NOT NULL,
+    started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT, cost_usd REAL
+);
+INSERT INTO schema_version (version) VALUES (1);
+";
+
+    /// Build a real v1 database with one session row, exactly as a 2a-era
+    /// build would have left it.
+    fn make_v1_db(db_path: &std::path::Path) {
+        let conn = Connection::open(db_path).expect("open raw v1 db");
+        conn.execute_batch(V1_SCHEMA_SQL).expect("apply v1 schema");
+        conn.execute(
+            "INSERT INTO sessions
+                (id, tool, native_id, name, cwd, mode, status, created_at, updated_at, cost_usd)
+             VALUES (1, 'claude-code', 'abc-123', 'old session', '/home/user/project',
+                     'interactive', 'completed', 1000, 2000, NULL)",
+            [],
+        )
+        .expect("insert v1 row");
+    }
+
+    #[test]
+    fn v1_db_migrates_to_v2_preserving_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("registry.db");
+        make_v1_db(&db_path);
+
+        let registry = Registry::open(&db_path).expect("open should migrate v1 → v2");
+
+        let version: i64 = registry
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let all = registry.all().expect("all() should succeed post-migration");
+        assert_eq!(all.len(), 1);
+        let got = &all[0];
+        assert_eq!(got.id, 1);
+        assert_eq!(got.tool, "claude-code");
+        assert_eq!(got.native_id.as_deref(), Some("abc-123"));
+        assert_eq!(got.name.as_deref(), Some("old session"));
+        assert_eq!(got.status, SessionStatus::Completed);
+        // Pre-v2 rows have no launch options.
+        assert_eq!(got.model, None);
+        assert_eq!(got.effort, None);
+    }
+
+    #[test]
+    fn migrated_db_round_trips_launch_options_and_is_idempotent_on_reopen() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("registry.db");
+        make_v1_db(&db_path);
+
+        {
+            let mut registry = Registry::open(&db_path).expect("open should migrate");
+            let id = registry.allocate_id().expect("allocate_id");
+            registry
+                .upsert(&sample_record(id))
+                .expect("upsert with model/effort should succeed post-migration");
+        }
+
+        // Second open: version is already 2 — must be a no-op, not a re-run.
+        let registry = Registry::open(&db_path).expect("reopen should be a no-op");
+        let all = registry.all().expect("all()");
+        assert_eq!(all.len(), 2);
+        let migrated = all.iter().find(|r| r.id == 1).expect("v1 row survives");
+        assert_eq!(migrated.model, None);
+        let new = all.iter().find(|r| r.id == 2).expect("new row present");
+        assert_eq!(new.model.as_deref(), Some("opus"));
+        assert_eq!(new.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn fresh_db_is_created_at_v2_directly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("registry.db");
+        let registry = Registry::open(&db_path).expect("open");
+        let version: i64 = registry
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn newer_schema_than_supported_refuses_to_open() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("registry.db");
+        {
+            let conn = Connection::open(&db_path).expect("open raw db");
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (99);",
+            )
+            .expect("stamp future version");
+        }
+        let err = match Registry::open(&db_path) {
+            Err(e) => e,
+            Ok(_) => panic!("must refuse a newer schema"),
+        };
+        assert!(matches!(err, StoreError::Open(msg) if msg.contains("v99")));
     }
 
     #[test]

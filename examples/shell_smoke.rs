@@ -174,12 +174,16 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     d.wait_for("home paints", "Home — roster", Duration::from_secs(10))?;
     d.snapshot("1-home");
 
-    // 2. Prefix + c opens the new-session picker; Enter launches the first
-    // row (Claude Code). Enter here lands on swarm-tui's picker, not a pane.
+    // 2. Prefix + c opens the new-session picker; Enter selects the first
+    // row (Claude Code), which declares launch options, so the options form
+    // opens — a second Enter with everything empty launches with tool
+    // defaults. Both Enters land on swarm-tui's own surfaces, not a pane.
     d.send(PREFIX)?;
     d.wait_for("prefix banner", "AWAITING COMMAND", Duration::from_secs(5))?;
     d.send(b"c")?;
     d.wait_for("picker opens", "New session", Duration::from_secs(5))?;
+    d.send(b"\r")?;
+    d.wait_for("options form opens", "Model:", Duration::from_secs(5))?;
     d.send(b"\r")?;
     d.wait_for("claude tab paints", "\u{276f}", Duration::from_secs(20))?; // ❯ prompt
     thread::sleep(Duration::from_millis(800)); // let the Ink UI settle
@@ -228,14 +232,18 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     d.wait_for("home after close", "Failed", Duration::from_secs(10))?;
     d.snapshot("7-home-after-close");
 
-    // 8. Second tool: picker → down → Enter spawns agy. While the repo dir is
-    // untrusted, agy boots to its workspace-trust dialog; after the owner
-    // trusts it (milestone 2b stage 2), the main UI boots instead — both
-    // paint a Gemini model name, so wait on that and report which state.
+    // 8. Second tool: picker → down → Enter selects agy, whose options form
+    // (model only) opens; Enter with an empty model launches defaults. While
+    // the repo dir is untrusted, agy boots to its workspace-trust dialog;
+    // after the owner trusts it (milestone 2b stage 2), the main UI boots
+    // instead — both paint a Gemini model name, so wait on that and report
+    // which state.
     d.send(PREFIX)?;
     d.send(b"c")?;
     d.wait_for("picker opens again", "New session", Duration::from_secs(5))?;
     d.send(b"j")?;
+    d.send(b"\r")?;
+    d.wait_for("agy options form", "Model:", Duration::from_secs(5))?;
     d.send(b"\r")?;
     d.wait_for("agy pane paints", "Gemini", Duration::from_secs(20))?;
     let trust_dialog = d.contents().contains("Do you trust");
