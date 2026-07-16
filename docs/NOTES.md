@@ -394,3 +394,67 @@ account state, never committed). Committed instead:
 `tests/fixtures/agy_usage.synthetic.txt`, hand-written to preserve each
 screen's structure with invented numbers, timezone, and email — same synthetic
 convention as `claude_agents_all.synthetic.json` (2b).
+
+## Milestone 2c complete — the swarm plan (2026-07-16)
+
+**What landed.** (1) The workspace roles file, `<launch cwd>/.swarm/swarm.json`
+(ADR-0010): schema v1, strict serde (`deny_unknown_fields`), roles as launch
+presets consumed by the new-session picker (listed above the raw tools),
+model/effort passed **verbatim**, startup commands injected in declared order
+after a stable first paint behind a type→verify-echo→Enter guard; registry
+schema v3 adds the `role` provenance column (v1 databases migrate through a
+v1→v2→v3 chain, each step its own transaction). The repo commits its own
+dogfood plan: `researcher` (agy, gemini-3.1-pro), `coder` (claude, opus-4.8,
+high), `advisor` (claude, sonnet-5, `/advisor fable`). (2) The Resources view
+(ADR-0011): prefix+`u`, one block per active vendor — plan role assignments,
+the vendor's own `/usage` screen captured verbatim by a hidden, unregistered,
+short-lived probe pane on **manual** refresh, a best-effort `%` headline, and
+a relative "as of Xm ago" timestamp. 27 new tests (81 total, was 54); the
+shell_smoke harness gained a Resources-toggle step and roles-aware picker
+navigation.
+
+**Probe-exception use (stage 1 entry above).** The four owner-whitelisted
+submissions (`/usage`+`/status` claude, `/usage`+`/credits` agy) were executed
+exactly once each via `slash_probe`'s usage mode; nothing else was ever
+submitted into a real CLI this milestone. The runtime Resources refresh
+injects `/usage` as user-initiated product behavior (ADR-0011) — no agent
+triggered it this session; the live path is on the owner smoke checklist.
+
+**Deviations / spec-premise corrections (all owner-decided in-session):**
+
+1. *"The existing ADR-0009 confirm" did not exist* — 2b shipped the
+   `[persists]` badge only; the palette injects immediately. The confirm built
+   in 2c applies to **startup injection only** (owner's pick); the attended
+   palette is unchanged, parity noted in ADR-0010 as a possible follow-up.
+2. *"as of HH:MM"* needs a timezone dependency std Rust doesn't have; owner
+   chose the roster's relative `format_age` style ("as of 3m ago") over a new
+   dep or UTC.
+3. *"Roster tooltip" for `purpose`* has no terminal equivalent — purpose
+   renders in the picker role line; the roster shows the role name column; the
+   session status line appends `· role <name>`.
+4. The plan's `role_spawn_stamps_role_and_seeds_startup_queue` test is not
+   unit-driven: exercising `open_new_session`'s happy path would spawn the
+   real CLI binary from a test (out of bounds). Every branch around it is
+   covered (picker no-op on failed probe, queue seeding/confirm/decline
+   through the real key path, persists precomputation); the spawn path itself
+   is on the owner smoke checklist.
+5. Runtime probes send `/usage` only; agy `/credits` stays research-recorded
+   (fixture-less) as a future refresh extension.
+6. Two-step injection (type, verify echo, then Enter) is stricter than the
+   brief's "inject after first paint" — grounded in the recorded 2b
+   trust-dialog behavior (dialogs swallow characters); the failure mode is
+   skip-and-note, never a blind Enter.
+
+**Nothing observed this milestone contradicts an accepted ADR.** ADR-0007 was
+amended in place (the `u` row) per the ADR-0009 precedent; ADR-0008's reversal
+note gains a compiler-guided second touch point (`adapters::all_kinds()`,
+pinned by test).
+
+**Open ⬜ after 2c** (see command-surfaces.md "Usage surfaces"): whether claude
+`/usage` shows all plan types (observed on Claude Pro only); agy Models &
+Quota reset times when a bucket is partially consumed (both buckets were at
+100.00% available during capture); agy `/credits` appearance with AI Credits
+enabled; plus everything still open from 2b (agy `--model` argument format —
+relevant to the dogfood `researcher` role's `gemini-3.1-pro` string — `/model`
+persistence, `/schedule` timer lifetime, claude `/effort max` stickiness, agy
+live-dispatch items, everything codex).
