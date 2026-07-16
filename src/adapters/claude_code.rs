@@ -14,21 +14,190 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{
-    AdapterCaps, AdapterError, CliAdapter, DispatchHandle, LaunchIntent, ResumeSupport,
-    StructuredOutput,
+    AdapterCaps, AdapterError, CliAdapter, DispatchHandle, LaunchIntent, LaunchOptions,
+    LaunchOptionsDecl, NativeCommand, ResumeSupport, StructuredOutput,
 };
 use crate::core::session::SessionRecord;
 use crate::core::task::Task;
 
 pub struct ClaudeCode;
 
-/// What research says the caps SHOULD be (npm 2.1.201, 2026-07-04). `probe()`
-/// must confirm against the installed binary, not assume.
+/// Picker suggestions for the free-text model field — the alias forms
+/// `claude --help` documents (✅ local 2026-07-16 at 2.1.211); any full model
+/// name is also accepted.
+pub const MODEL_SUGGESTIONS: &[&str] = &["fable", "opus", "sonnet"];
+
+/// `--effort` accepted levels, verbatim from `claude --help`
+/// (✅ local 2026-07-16 at 2.1.211).
+pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// What research says the caps SHOULD be (npm 2.1.201, 2026-07-04; launch
+/// decl re-verified locally 2026-07-16 at 2.1.211). `probe()` must confirm
+/// against the installed binary, not assume.
 pub const EXPECTED_CAPS: AdapterCaps = AdapterCaps {
     structured_output: StructuredOutput::StreamJson,
     resume: ResumeSupport::ById,
     background_supervisor: true,
+    launch: LaunchOptionsDecl {
+        model: Some(MODEL_SUGGESTIONS),
+        effort: Some(EFFORT_LEVELS),
+    },
 };
+
+/// Palette table (ADR-0009): every entry is ✅ *(local 2026-07-16)* in
+/// `docs/integrations/command-surfaces.md` — present in the installed 2.1.211
+/// "/" menu. Deliberately excluded from the ✅ set: `/agents` (a "(removed)"
+/// stub) and the `/cost` alias row (folded into `/usage`). `persists` flags
+/// mirror the doc's column; the adapter test pins that correspondence.
+const COMMANDS: &[NativeCommand] = &[
+    NativeCommand {
+        name: "/model",
+        inject: "/model",
+        description: "Set the AI model (choice sticks as your default)",
+        args_hint: Some("model or alias: fable, opus, sonnet — empty opens the picker"),
+        persists: true,
+    },
+    NativeCommand {
+        name: "/effort",
+        inject: "/effort",
+        description: "Set effort level for model usage",
+        args_hint: Some("low | medium | high | xhigh | max | ultracode | auto"),
+        persists: true,
+    },
+    NativeCommand {
+        name: "/advisor",
+        inject: "/advisor",
+        description: "Let Claude consult a stronger model at key moments",
+        args_hint: Some("opus | sonnet | fable | off"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/resume",
+        inject: "/resume",
+        description: "Resume a previous conversation",
+        args_hint: Some("session id or name — empty opens the picker"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/branch",
+        inject: "/branch",
+        description: "Create a branch of the conversation at this point",
+        args_hint: Some("branch name"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/fork",
+        inject: "/fork",
+        description: "Spawn a background agent that inherits the full conversation",
+        args_hint: Some("directive for the forked agent"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/rewind",
+        inject: "/rewind",
+        description: "Restore the code and/or conversation to a previous point",
+        args_hint: None,
+        persists: false,
+    },
+    NativeCommand {
+        name: "/rename",
+        inject: "/rename",
+        description: "Rename the current conversation",
+        args_hint: Some("new name"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/compact",
+        inject: "/compact",
+        description: "Free up context by summarizing the conversation",
+        args_hint: Some("optional focus instructions"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/context",
+        inject: "/context",
+        description: "Visualize current context usage as a colored grid",
+        args_hint: None,
+        persists: false,
+    },
+    NativeCommand {
+        name: "/usage",
+        inject: "/usage",
+        description: "Show session cost, plan usage, and activity stats (alias /cost)",
+        args_hint: None,
+        persists: false,
+    },
+    NativeCommand {
+        name: "/status",
+        inject: "/status",
+        description: "Show version, model, account, and connectivity status",
+        args_hint: None,
+        persists: false,
+    },
+    NativeCommand {
+        name: "/tasks",
+        inject: "/tasks",
+        description: "View and manage everything running in the background",
+        args_hint: None,
+        persists: false,
+    },
+    NativeCommand {
+        name: "/background",
+        inject: "/background",
+        description: "Send this session to the background and free the terminal",
+        args_hint: None,
+        persists: false,
+    },
+    NativeCommand {
+        name: "/goal",
+        inject: "/goal",
+        description: "Set a goal Claude checks before stopping",
+        args_hint: Some("goal condition, or: clear"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/btw",
+        inject: "/btw",
+        description: "Ask a side question without interrupting the conversation",
+        args_hint: Some("question"),
+        persists: false,
+    },
+    NativeCommand {
+        name: "/plan",
+        inject: "/plan",
+        description: "Enable plan mode or view the current session plan",
+        args_hint: None,
+        persists: false,
+    },
+    NativeCommand {
+        name: "/permissions",
+        inject: "/permissions",
+        description: "Manage allow/deny tool permission rules",
+        args_hint: None,
+        persists: true,
+    },
+    NativeCommand {
+        name: "/memory",
+        inject: "/memory",
+        description: "Open a memory file in your editor",
+        args_hint: None,
+        persists: true,
+    },
+    NativeCommand {
+        name: "/keybindings",
+        inject: "/keybindings",
+        description: "Open your keyboard shortcuts file",
+        args_hint: None,
+        persists: true,
+    },
+    NativeCommand {
+        name: "/config",
+        inject: "/config",
+        description: "Open settings (alias /settings)",
+        args_hint: None,
+        persists: true,
+    },
+];
 
 impl CliAdapter for ClaudeCode {
     fn id(&self) -> &'static str {
@@ -73,6 +242,12 @@ impl CliAdapter for ClaudeCode {
         let has_session_id = has("--session-id");
         let has_bg = has("--bg") || has("--background");
         let has_max_budget = has("--max-budget-usd");
+        // Launch-option decl (ADR-0009): offer a picker field only when the
+        // installed binary's --help lists the flag (both present at 2.1.211).
+        let launch = LaunchOptionsDecl {
+            model: has("--model").then_some(MODEL_SUGGESTIONS),
+            effort: has("--effort").then_some(EFFORT_LEVELS),
+        };
 
         // has_print/has_max_budget don't map to an `AdapterCaps` field (the
         // struct only tracks structured_output/resume/background_supervisor)
@@ -103,10 +278,11 @@ impl CliAdapter for ClaudeCode {
             structured_output,
             resume,
             background_supervisor,
+            launch,
         })
     }
 
-    fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
+    fn interactive_cmd(&self, intent: &LaunchIntent, opts: &LaunchOptions, cwd: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
         match intent {
             LaunchIntent::Fresh { session_id_hint } => {
@@ -123,8 +299,19 @@ impl CliAdapter for ClaudeCode {
                 cmd.arg("--continue");
             }
         }
+        // Session-scoped flags, applied for every intent (ADR-0009).
+        if let Some(model) = &opts.model {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(effort) = &opts.effort {
+            cmd.arg("--effort").arg(effort);
+        }
         cmd.current_dir(cwd);
         cmd
+    }
+
+    fn command_table(&self) -> &'static [NativeCommand] {
+        COMMANDS
     }
 
     fn dispatch(&self, _task: &Task) -> Result<DispatchHandle, AdapterError> {
@@ -205,6 +392,72 @@ impl ClaudeCode {
                  (not an array or object)"
                     .to_string(),
             )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn opts(model: Option<&str>, effort: Option<&str>) -> LaunchOptions {
+        LaunchOptions {
+            model: model.map(String::from),
+            effort: effort.map(String::from),
+        }
+    }
+
+    #[test]
+    fn fresh_with_hint_still_maps_to_session_id() {
+        let intent = LaunchIntent::Fresh {
+            session_id_hint: Some("abc-123".to_string()),
+        };
+        let cmd = ClaudeCode.interactive_cmd(&intent, &LaunchOptions::default(), Path::new("/tmp"));
+        assert_eq!(cmd.get_program(), "claude");
+        assert_eq!(argv(&cmd), ["--session-id", "abc-123"]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn default_options_add_no_flags() {
+        let intent = LaunchIntent::Fresh {
+            session_id_hint: None,
+        };
+        let cmd = ClaudeCode.interactive_cmd(&intent, &LaunchOptions::default(), Path::new("/tmp"));
+        assert!(argv(&cmd).is_empty());
+    }
+
+    #[test]
+    fn model_and_effort_append_for_every_intent() {
+        let o = opts(Some("opus"), Some("high"));
+        let cases: [(LaunchIntent, &[&str]); 3] = [
+            (
+                LaunchIntent::Fresh {
+                    session_id_hint: Some("abc".to_string()),
+                },
+                &["--session-id", "abc", "--model", "opus", "--effort", "high"],
+            ),
+            (
+                LaunchIntent::Resume {
+                    native_id: "xyz".to_string(),
+                },
+                &["--resume", "xyz", "--model", "opus", "--effort", "high"],
+            ),
+            (
+                LaunchIntent::ContinueMostRecent,
+                &["--continue", "--model", "opus", "--effort", "high"],
+            ),
+        ];
+        for (intent, expected) in cases {
+            let cmd = ClaudeCode.interactive_cmd(&intent, &o, Path::new("/tmp"));
+            assert_eq!(argv(&cmd), expected);
         }
     }
 }

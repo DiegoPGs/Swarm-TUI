@@ -11,8 +11,8 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{
-    AdapterCaps, AdapterError, CliAdapter, DispatchHandle, LaunchIntent, ResumeSupport,
-    StructuredOutput,
+    AdapterCaps, AdapterError, CliAdapter, DispatchHandle, LaunchIntent, LaunchOptions,
+    LaunchOptionsDecl, ResumeSupport, StructuredOutput,
 };
 use crate::core::session::SessionRecord;
 use crate::core::task::Task;
@@ -20,10 +20,14 @@ use crate::core::task::Task;
 pub struct Codex;
 
 /// Research-expected caps (npm 0.142.5, 2026-07-04); `probe()` must confirm.
+/// Launch decl is NONE and the command table stays the trait default `&[]`:
+/// codex is suspended (ADR-0008) and nothing here is locally verifiable —
+/// populate both from observation on reversal (ADR-0009's ✅-only rule).
 pub const EXPECTED_CAPS: AdapterCaps = AdapterCaps {
     structured_output: StructuredOutput::StreamJson,
     resume: ResumeSupport::ById,
     background_supervisor: false,
+    launch: LaunchOptionsDecl::NONE,
 };
 
 impl CliAdapter for Codex {
@@ -75,10 +79,13 @@ impl CliAdapter for Codex {
             structured_output,
             resume,
             background_supervisor: EXPECTED_CAPS.background_supervisor,
+            launch: LaunchOptionsDecl::NONE,
         })
     }
 
-    fn interactive_cmd(&self, intent: &LaunchIntent, cwd: &Path) -> Command {
+    // `_opts` ignored entirely: codex steers model via config profiles, not
+    // flags (codex.md), and is suspended anyway (ADR-0008).
+    fn interactive_cmd(&self, intent: &LaunchIntent, _opts: &LaunchOptions, cwd: &Path) -> Command {
         let mut cmd = Command::new(self.binary());
         match intent {
             LaunchIntent::Fresh { .. } => {}
@@ -115,5 +122,30 @@ impl CliAdapter for Codex {
     ) -> Result<DispatchHandle, AdapterError> {
         // TODO(next session): codex exec resume <native_id> --json <prompt>.
         todo!("headless follow-up via codex exec resume (ADR-0001)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn launch_options_are_ignored_entirely() {
+        let intent = LaunchIntent::Resume {
+            native_id: "tid-9".to_string(),
+        };
+        let opts = LaunchOptions {
+            model: Some("o5".to_string()),
+            effort: Some("max".to_string()),
+        };
+        let cmd = Codex.interactive_cmd(&intent, &opts, Path::new("/tmp"));
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Suspended (ADR-0008) and flagless for model/effort (codex.md):
+        // options must leave the argv untouched.
+        assert_eq!(argv, ["resume", "tid-9"]);
     }
 }

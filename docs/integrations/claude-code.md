@@ -10,6 +10,10 @@ Verified 2026-07-04 against the official CLI reference and headless docs
 every check in `scripts/verify-clis.sh` passed. Items marked ✅ *(local 2026-07-05)*
 were flipped or re-confirmed against the live binary that day.
 
+**Local re-check 2026-07-16:** installed version now **2.1.211** (same path). Facts
+re-verified at this version are stamped ✅ *(local 2026-07-16)* inline; the
+slash-command surface at this version lives in `command-surfaces.md`.
+
 ## Invocation
 
 - ✅ Interactive: `claude`, `claude "initial prompt"`, resume with
@@ -34,6 +38,10 @@ were flipped or re-confirmed against the live binary that day.
 - ✅ `--session-id <uuid>` pre-assigns the ID (swarm-tui generates it → no parsing);
   `--name/-n` names a session, resumable by name; `--fork-session` branches on resume;
   `--no-session-persistence` for throwaway runs.
+  ✅ *(local 2026-07-16)*: `--session-id <uuid>` is accepted on an **interactive
+  fresh spawn** — swarm-tui's own spawn path (`claude --session-id <hint>` from
+  `open_new_session`) boots to the prompt normally at 2.1.211, observed via
+  `examples/shell_smoke.rs` (characters only, nothing submitted).
 - ✅ Native background sessions: `claude --bg "task"` (prints session ID, returns),
   `claude agents --json [--all]` lists them as JSON, `claude logs <id>`,
   `claude attach <id>` (adopt into a terminal — maps directly onto tab promotion),
@@ -71,6 +79,16 @@ were flipped or re-confirmed against the live binary that day.
   `--allowedTools` / `--disallowedTools` / `--tools`, `--max-turns`,
   `--max-budget-usd <amount>` (print mode), `--permission-prompt-tool <mcp-tool>` for
   programmatic approval handling (a v2 option for surfacing approvals in the home view).
+  ✅ *(local 2026-07-16)* At 2.1.211 the `--help` choices are `acceptEdits, auto,
+  bypassPermissions, manual, dontAsk, plan` — **`default` has become `manual`**.
+
+## Launch options (interactive — milestone 2b)
+
+- ✅ *(local 2026-07-16)* `--model <model>` — "Model for the current session";
+  aliases `fable`, `opus`, `sonnet`, or a full model name (`claude-fable-5`).
+- ✅ *(local 2026-07-16)* `--effort <level>` — `low, medium, high, xhigh, max`.
+- The in-TUI slash-command surface at 2.1.211 (incl. `/model` and `/effort`
+  persistence semantics) lives in [`command-surfaces.md`](command-surfaces.md).
 
 ## MCP posture
 

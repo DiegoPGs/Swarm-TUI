@@ -199,3 +199,144 @@ on this machine (`command -v codex` fails) — the codex-verification pass from 
 Stage E brief (re-run `scripts/verify-clis.sh`, settle the `docs/integrations/
 codex.md` ⬜ items, re-run the fidelity spike) stays deferred until the owner
 installs it, unchanged from the 2026-07-05 entry above.
+
+## Milestone 2b — Stage 0: local validation (2026-07-16)
+
+**Gates: all green.** `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo check`, `cargo test` (29/29), and `cargo run --example
+fidelity_spike` all pass on the target machine. Installed versions this session:
+`claude` **2.1.211**, `agy` **1.1.3**, codex still absent.
+
+**CI: enabled and green.** The `CI` workflow has two successful runs on GitHub —
+`29387475686` (push to main, 2026-07-15, the milestone-2a merge) and `29386886662`
+(the PR run). Nothing needed enabling.
+
+**Fidelity spike re-run (claude 2.1.211 / agy 1.1.3) — ADR-0003 verdict unchanged.**
+Two report lines differ from the 2026-07-05 run, both explained and neither a
+rendering defect:
+
+- *claude, "1 differing line" (widget vs vt100)*: the diff is the **cursor cell** —
+  `tui_term::PseudoTerminal` paints `█` at the cursor position while
+  `vt100::Screen::contents()` renders no cursor glyph. Comparison artifact of the
+  spike's proxy check, not a fidelity failure (on 2026-07-05 the cursor happened to
+  sit on content the proxy trimmed).
+- *agy, "echo of typed chars: DEFECT"*: the repo dir is an untrusted agy workspace,
+  so agy boots to its workspace-trust dialog, which by design ignores character keys
+  (recorded 2026-07-05). Chars typed at that dialog don't echo. Expected state, not
+  a defect. Incidental drift observation from the dialog footer: agy 1.1.3's default
+  model indicator reads **"Gemini 3.1 Pro (High)"** (the page recorded a 3.5 Flash
+  default at v1.0.14–1.0.16) — refreshed in the Stage 2 pass.
+
+**2a smoke checklist: executed, all steps OK.** Deviation to note: the milestone-2a
+entry above recorded no smoke checklist, so the checklist executed here is the one
+from the milestone-2b brief. tmux isn't installed, so the checklist is driven by a
+new PTY harness, `examples/shell_smoke.rs` (`cargo build && cargo run --example
+shell_smoke`), which boots the real `target/debug/swarm-tui` inside `portable-pty`
+with `SWARM_TUI_DATA_DIR` pointed at a throwaway tempdir (the real registry is never
+touched) and gates every step on an on-screen vt100 marker. Enter is pressed only on
+swarm-tui's own surfaces (picker/roster/confirms); wrapped panes receive printable
+characters only. Results (2026-07-16):
+
+| Step | Result |
+| --- | --- |
+| Home paints (empty roster) | OK |
+| prefix banner (`Ctrl-Space`) → picker (`c`) | OK |
+| claude tab: paint (`--session-id <uuid>` spawn path) | OK |
+| claude tab: typed characters echo (no Enter) | OK |
+| claude tab: repaint after 120×40 → 100×30 resize | OK |
+| detach (`d`) → Home shows `[detached]` badge | OK |
+| re-attach (Enter on roster row) restores the pane | OK |
+| close (`x`, confirm) → row lands `Failed` (killed) | OK |
+| agy tab: pane paints — trust dialog renders | OK (dialog visible) |
+| close agy, quit (`q`) — clean exit 0 | OK |
+
+Incidental ✅: the claude spawn path proves `claude --session-id <uuid>` is accepted
+on an **interactive fresh spawn** at 2.1.211 — stamped in
+`docs/integrations/claude-code.md`.
+
+**Open-⬜ review (read-only pass):** `claude-code.md` had no open ⬜ items.
+`antigravity.md`'s three ⬜ items all require a live headless dispatch ("run
+supervised") and stay open by design this milestone.
+
+## Milestone 2b — Stage 2: command-surface research (2026-07-16)
+
+Produced `docs/integrations/command-surfaces.md`: the claude 2.1.211 and agy 1.1.3
+slash-command tables (with persistence flags), launch-flag facts, and the
+cross-tool concept map. Method: official docs (code.claude.com/docs/en/commands;
+`agy changelog` release notes) plus local observation via the new
+`examples/slash_probe.rs` — each TUI booted in a PTY, "/" typed, the autocomplete
+menu walked/filtered and vt100-snapshotted, then Esc + kill. Characters, arrows,
+backspace, Esc only; nothing submitted. Headlines: **/advisor is real** (menu +
+docs, ≥2.1.170); **/rename exists locally but not on the official page**; agy
+**/goal and /schedule are real at 1.1.3**; `/resume` carries both `/switch` and
+`/conversation` aliases; agy grew `--agent`/`--mode` since v1.0.14 and still has no
+structured-output flag.
+
+**Workspace-trust authorization (owner-granted 2026-07-16, in-chat).** Reaching
+agy's prompt required answering its workspace-trust dialog — normally forbidden
+twice over (Enter in a real pane; persisting agy config). The owner authorized
+answering it **once for this repo dir**. Execution note, in the interest of full
+disclosure: the first probe run inherited a stale shell cwd and opened agy in
+`target/slash-probe/`, so the accept landed on that subdirectory — an accidental
+extra trusted-workspace entry in agy's state (contents identical to the repo; the
+owner can prune it via agy `/config` if desired). The harness was then hardened to
+anchor on `CARGO_MANIFEST_DIR` (cwd can no longer leak into probe runs) and re-run
+from the repo root, where the authorized accept was performed. Net agy state
+change: two trusted-workspace entries (repo root — intended; `target/slash-probe`
+— accidental, disclosed).
+
+**Fidelity-spike follow-up:** with the repo now trusted, agy boots to its prompt,
+so the spike's "echo of typed chars" check passes again at 1.1.3 (the stage-0
+DEFECT line was the trust dialog swallowing chars, as recorded above).
+
+## Milestone 2b complete — two worlds, one command plane (2026-07-16)
+
+Everything shipped on branch `feat/milestone-2b-command-plane` (PR for owner
+review, not merged). Stage map: 0 validation → 1 ADR-0008 codex suspension →
+2 command-surface research → 3 ADR-0009 + the two `CliAdapter` changes →
+4 launch options + palette → 5 tests → 6 this docs pass.
+
+**The two adapter-boundary changes (owner-authorized in the milestone plan,
+recorded in ADR-0009):** `interactive_cmd(intent, opts: &LaunchOptions, cwd)`
+(claude maps `--model`/`--effort`, agy `--model` only, codex ignores both) and
+`command_table() -> &'static [NativeCommand]` (default `&[]`; claude 21 entries,
+agy 19, codex 0 — populated strictly from ✅-local rows in
+`command-surfaces.md`). Launch-option declaration rides on `AdapterCaps.launch`,
+probe-gated on `--help` — no third trait method.
+
+**Registry schema v2.** `sessions` gains `model TEXT, effort TEXT`; `open()` now
+actually reads `schema_version` (it never did in v1): fresh DBs are created at v2,
+v1 DBs migrate in one transaction (additive ALTERs), anything newer than v2
+refuses to open. Migration is covered by tests building a verbatim-v1 database.
+Suggested once before the first post-merge run:
+`cp "$XDG_DATA_HOME/swarm-tui/registry.db" "$XDG_DATA_HOME/swarm-tui/registry.db.bak"`
+(defensive only; the migration is additive).
+
+**Fixed along the way (pre-existing, surfaced by this milestone's gates):**
+
+- `src/pty/local.rs` exit-status race: PTY EOF can precede the kernel exposing
+  the child's exit status; the single non-blocking `try_wait()` misreported
+  clean exits as failures (~50% flake on `exit_detection_reports_success_and_
+  failure` under parallel test load). Now polls briefly on EOF, lock released
+  between polls. Six consecutive full-suite runs green after the fix.
+- Home roster Status column: the new Model/Effort columns initially squeezed
+  Status below 18 chars, truncating the `[detached]` badge — caught by the
+  `shell_smoke` harness, width restored (the badge string is exactly 18 chars).
+
+**Deviations / disclosures (also in the stage entries above):** the 2a smoke
+checklist was never recorded in NOTES, so stage 0 authored it from the
+milestone-2b brief; the agy trust accept misfired once into `target/slash-probe`
+before landing on the repo root (stage 2 entry — harnesses now anchor on
+`CARGO_MANIFEST_DIR`); claude's `/agents` is a "(removed)" stub at 2.1.211 and is
+deliberately excluded from the palette table; `/cost` is folded into `/usage` as
+an alias. Nothing observed this milestone contradicts an accepted ADR — ADR-0007
+was amended (not superseded) with the `:` row per the owner's instruction,
+recorded in ADR-0009.
+
+**Still open ⬜ after 2b** (see `command-surfaces.md` + `antigravity.md`):
+agy `--model` accepted argument format (supervised one-liner recorded); agy
+`/model` persistence mechanism (🔶 sticky-default evidence); whether agy
+`/schedule` timers outlive the session; claude `/effort max`/`ultracode`
+persistence nuance (owner-reported 🔶 vs. undistinguishing official docs); the
+three pre-existing agy live-dispatch items; everything codex (suspended,
+ADR-0008).

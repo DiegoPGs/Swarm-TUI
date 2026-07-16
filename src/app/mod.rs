@@ -1,7 +1,9 @@
 //! Application layer: terminal setup, event loop, layout, tab switching.
 //!
 //! Knows CLIs? **Almost never.** This layer speaks `crate::core` vocabulary
-//! (sessions, tasks, `AgentEvent`) and `crate::pty::PaneHost` surfaces. The one
+//! (sessions, tasks, `AgentEvent`), `crate::pty::PaneHost` surfaces, and the
+//! data-only launch/command vocabulary from `crate::adapters` (`AdapterCaps`,
+//! `LaunchIntent`, `LaunchOptions`, `NativeCommand` — ADR-0009). The one
 //! pre-authorized exception (this stage) is matching on `adapters::AdapterKind`
 //! to decide the claude native_id-hint prepopulation in `open_new_session` —
 //! `AdapterKind` is already a shared, CLI-agnostic-safe identifier `app` uses
@@ -12,6 +14,7 @@
 
 pub mod home;
 pub mod keys;
+pub mod palette;
 pub mod reconcile;
 pub mod session_view;
 pub mod tabs;
@@ -28,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -142,14 +145,48 @@ pub enum ConfirmAction {
     Quit,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct NewSessionPicker {
-    pub selected: usize,
+/// The new-session picker, now two-stage (ADR-0009): choose a tool, then —
+/// when its adapter declares launch options — fill a small options form.
+/// Tools declaring nothing spawn straight from stage one.
+#[derive(Debug, Clone)]
+pub enum PickerState {
+    ChooseTool {
+        selected: usize,
+    },
+    Options {
+        kind: AdapterKind,
+        /// Copied out of `probe_cache` when the tool was chosen, so drawing
+        /// and key handling never re-consult the cache.
+        decl: adapters::LaunchOptionsDecl,
+        model: String,
+        /// 0 = tool default (send nothing); 1.. indexes `decl.effort`.
+        effort_idx: usize,
+    },
 }
 
 fn is_ctrl_space(key: &KeyEvent) -> bool {
     (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
         || key.code == KeyCode::Null
+}
+
+/// Map the options-form state to `LaunchOptions`: a field only materializes
+/// when the adapter declared it AND the user chose something (empty model
+/// text / effort index 0 mean "tool default" → send nothing).
+fn build_launch_options(
+    model_text: &str,
+    effort_idx: usize,
+    decl: &adapters::LaunchOptionsDecl,
+) -> adapters::LaunchOptions {
+    let model = match decl.model {
+        Some(_) if !model_text.trim().is_empty() => Some(model_text.trim().to_string()),
+        _ => None,
+    };
+    let effort = decl
+        .effort
+        .filter(|_| effort_idx > 0)
+        .and_then(|levels| levels.get(effort_idx - 1))
+        .map(|level| level.to_string());
+    adapters::LaunchOptions { model, effort }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +203,8 @@ pub struct App {
     pub input_mode: InputMode,
     pub probe_cache: HashMap<AdapterKind, Result<AdapterCaps, AdapterError>>,
     pub pending_confirm: Option<ConfirmAction>,
-    pub new_session_picker: Option<NewSessionPicker>,
+    pub new_session_picker: Option<PickerState>,
+    pub palette: Option<palette::PaletteState>,
     pub show_keymap_overlay: bool,
     /// Size newly spawned/live panes are kept at: terminal area minus the
     /// tab bar row. Recomputed every `draw()` call so it tracks real resizes
@@ -238,7 +276,7 @@ impl App {
         config: &SwarmTuiConfig,
     ) -> Result<(App, UnboundedReceiver<PaneId>), AppError> {
         let mut probe_cache = HashMap::new();
-        for kind in adapters::registry() {
+        for &kind in adapters::registry() {
             probe_cache.insert(kind, kind.probe());
         }
 
@@ -268,6 +306,7 @@ impl App {
                 probe_cache,
                 pending_confirm: None,
                 new_session_picker: None,
+                palette: None,
                 show_keymap_overlay: false,
                 pane_area_size,
             },
@@ -335,7 +374,13 @@ impl App {
                     .as_deref()
                     .map(|n| format!(" [{n}]"))
                     .unwrap_or_default();
-                format!("{}{native}  —  {HINT}", r.tool)
+                let launch = match (r.model.as_deref(), r.effort.as_deref()) {
+                    (Some(m), Some(e)) => format!(" · {m}/{e}"),
+                    (Some(m), None) => format!(" · {m}"),
+                    (None, Some(e)) => format!(" · effort {e}"),
+                    (None, None) => String::new(),
+                };
+                format!("{}{native}{launch}  —  {HINT}", r.tool)
             }
             None => format!("session #{session_id}  —  {HINT}"),
         }
@@ -343,20 +388,27 @@ impl App {
 
     // -- session lifecycle ---------------------------------------------------
 
-    /// New session (prefix `c`): the app generates the claude session-id
-    /// hint UNCONDITIONALLY for every tool — only `claude_code.rs`'s own
-    /// `interactive_cmd` match arm decides whether to consume it. This keeps
-    /// the ADR-0006 boundary intact: `app` never asks "is this claude?" to
-    /// decide whether to generate a hint, only to decide whether the
-    /// registry should prepopulate `native_id` with it (see the module doc).
-    fn open_new_session(&mut self, kind: AdapterKind) -> Result<(), AppError> {
+    /// New session (prefix `c`, then the picker): the app generates the
+    /// claude session-id hint UNCONDITIONALLY for every tool — only
+    /// `claude_code.rs`'s own `interactive_cmd` match arm decides whether to
+    /// consume it. This keeps the ADR-0006 boundary intact: `app` never asks
+    /// "is this claude?" to decide whether to generate a hint, only to decide
+    /// whether the registry should prepopulate `native_id` with it (see the
+    /// module doc). `opts` are the user's picker choices (ADR-0009); the
+    /// adapter maps what it supports and the registry row remembers them.
+    fn open_new_session(
+        &mut self,
+        kind: AdapterKind,
+        opts: adapters::LaunchOptions,
+    ) -> Result<(), AppError> {
         let hint = uuid::Uuid::new_v4().to_string();
         let intent = adapters::LaunchIntent::Fresh {
             session_id_hint: Some(hint.clone()),
         };
-        // TODO(2b): prompt for cwd instead of always using the launch cwd.
+        // TODO(2b follow-up): prompt for cwd instead of always using the
+        // launch cwd.
         let cwd = std::env::current_dir()?;
-        let cmd = kind.interactive_cmd(&intent, &cwd);
+        let cmd = kind.interactive_cmd(&intent, &opts, &cwd);
         let pane_id = self.pane_host.spawn(cmd, self.pane_area_size)?;
 
         let id = self.registry.allocate_id()?;
@@ -376,6 +428,8 @@ impl App {
             created_at: now,
             updated_at: now,
             cost_usd: None,
+            model: opts.model,
+            effort: opts.effort,
         };
         self.registry.upsert(&record)?;
         self.pane_of_session.insert(record.id, pane_id);
@@ -450,6 +504,10 @@ impl App {
         }
         if self.new_session_picker.is_some() {
             self.handle_picker_key(key);
+            return false;
+        }
+        if self.palette.is_some() {
+            self.handle_palette_key(key);
             return false;
         }
         if self.show_keymap_overlay {
@@ -538,8 +596,9 @@ impl App {
             KeyCode::Char('n') => self.tabs.next(),
             KeyCode::Char('p') => self.tabs.prev(),
             KeyCode::Char('c') => {
-                self.new_session_picker = Some(NewSessionPicker { selected: 0 });
+                self.new_session_picker = Some(PickerState::ChooseTool { selected: 0 });
             }
+            KeyCode::Char(':') => self.open_palette(),
             KeyCode::Char('d') => self.detach_active_tab(),
             KeyCode::Char('x') => {
                 if matches!(
@@ -572,6 +631,107 @@ impl App {
             _ => {}
         }
         quit_now
+    }
+
+    /// Open the command palette (prefix `:`, ADR-0009) — session tabs only,
+    /// and only when the pane is alive and the tool has a non-empty command
+    /// table. Silently a no-op otherwise (matching the other one-shot keys).
+    fn open_palette(&mut self) {
+        let Some(Tab::Session { session_id }) = self.tabs.items.get(self.tabs.active) else {
+            return;
+        };
+        let session_id = *session_id;
+        let Some(&pane_id) = self.pane_of_session.get(&session_id) else {
+            return;
+        };
+        if self.pane_host.is_exited(pane_id) {
+            return;
+        }
+        let Some(kind) = self
+            .record_for(session_id)
+            .and_then(|r| AdapterKind::from_slug(&r.tool))
+        else {
+            return;
+        };
+        let entries = kind.command_table();
+        if entries.is_empty() {
+            return;
+        }
+        self.palette = Some(palette::PaletteState::new(
+            pane_id,
+            kind.display_name(),
+            entries,
+        ));
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        let Some(pal) = self.palette.as_mut() else {
+            return;
+        };
+
+        // Argument sub-stage: free text for an entry that declared a hint.
+        if let Some(args) = pal.args.as_mut() {
+            match key.code {
+                KeyCode::Esc => pal.args = None,
+                KeyCode::Enter => {
+                    let entry = &pal.entries[args.command_index];
+                    let text = args.text.trim().to_string();
+                    let bytes =
+                        palette::injection_bytes(entry, (!text.is_empty()).then_some(&*text));
+                    let pane_id = pal.pane_id;
+                    self.palette = None;
+                    let _ = self.pane_host.write_input(pane_id, &bytes);
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    args.text.push(c);
+                }
+                KeyCode::Backspace => {
+                    args.text.pop();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Up => pal.selected = pal.selected.saturating_sub(1),
+            KeyCode::Down => {
+                let len = palette::filtered_indices(pal.entries, &pal.filter).len();
+                if pal.selected + 1 < len {
+                    pal.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let filtered = palette::filtered_indices(pal.entries, &pal.filter);
+                let Some(&entry_index) = filtered.get(pal.selected) else {
+                    return; // filter matches nothing — keep the palette open
+                };
+                let entry = &pal.entries[entry_index];
+                if entry.args_hint.is_some() {
+                    pal.args = Some(palette::ArgsState {
+                        command_index: entry_index,
+                        text: String::new(),
+                    });
+                } else {
+                    let bytes = palette::injection_bytes(entry, None);
+                    let pane_id = pal.pane_id;
+                    self.palette = None;
+                    let _ = self.pane_host.write_input(pane_id, &bytes);
+                }
+            }
+            // Letters feed the filter (↑/↓ own navigation); Ctrl-modified
+            // chords — including the global prefix — are ignored here.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                pal.filter.push(c);
+                pal.selected = 0;
+            }
+            KeyCode::Backspace => {
+                pal.filter.pop();
+                pal.selected = 0;
+            }
+            _ => {}
+        }
     }
 
     async fn handle_confirm_key(&mut self, action: ConfirmAction, key: KeyEvent) -> bool {
@@ -607,31 +767,109 @@ impl App {
     fn handle_picker_key(&mut self, key: KeyEvent) {
         let kinds = adapters::registry();
         let len = kinds.len();
-        let Some(picker) = self.new_session_picker.as_mut() else {
+        // Take the state out so the arms below can call &mut self methods;
+        // every path either reinstalls an updated state or ends the picker.
+        let Some(picker) = self.new_session_picker.take() else {
             return;
         };
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.selected = (picker.selected + len - 1) % len;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.selected = (picker.selected + 1) % len;
-            }
-            KeyCode::Esc => {
-                self.new_session_picker = None;
-            }
-            KeyCode::Enter => {
-                let kind = kinds[picker.selected];
-                let installed = matches!(self.probe_cache.get(&kind), Some(Ok(_)));
-                if installed {
-                    self.new_session_picker = None;
-                    let _ = self.open_new_session(kind);
+        match picker {
+            PickerState::ChooseTool { selected } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.new_session_picker = Some(PickerState::ChooseTool {
+                        selected: (selected + len - 1) % len,
+                    });
                 }
-                // Else: a failed-probe ("not installed") entry is greyed and
-                // disabled per ARCHITECTURE.md — Enter is a no-op and the
-                // picker stays open so the user can pick a different tool.
-            }
-            _ => {}
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.new_session_picker = Some(PickerState::ChooseTool {
+                        selected: (selected + 1) % len,
+                    });
+                }
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let kind = kinds[selected];
+                    match self.probe_cache.get(&kind) {
+                        Some(Ok(caps)) if caps.launch.any() => {
+                            // Tool declares launch options → options form.
+                            self.new_session_picker = Some(PickerState::Options {
+                                kind,
+                                decl: caps.launch,
+                                model: String::new(),
+                                effort_idx: 0,
+                            });
+                        }
+                        Some(Ok(_)) => {
+                            let _ = self.open_new_session(kind, adapters::LaunchOptions::default());
+                        }
+                        _ => {
+                            // Failed-probe ("not installed") entries are greyed
+                            // and disabled per ARCHITECTURE.md — Enter is a
+                            // no-op and the picker stays open.
+                            self.new_session_picker = Some(PickerState::ChooseTool { selected });
+                        }
+                    }
+                }
+                _ => {
+                    self.new_session_picker = Some(PickerState::ChooseTool { selected });
+                }
+            },
+            PickerState::Options {
+                kind,
+                decl,
+                mut model,
+                mut effort_idx,
+            } => match key.code {
+                KeyCode::Esc => {
+                    // Back to the tool list, cursor restored onto this tool.
+                    let selected = kinds.iter().position(|k| *k == kind).unwrap_or(0);
+                    self.new_session_picker = Some(PickerState::ChooseTool { selected });
+                }
+                KeyCode::Enter => {
+                    let opts = build_launch_options(&model, effort_idx, &decl);
+                    let _ = self.open_new_session(kind, opts);
+                }
+                KeyCode::Char(c) if decl.model.is_some() => {
+                    model.push(c);
+                    self.new_session_picker = Some(PickerState::Options {
+                        kind,
+                        decl,
+                        model,
+                        effort_idx,
+                    });
+                }
+                KeyCode::Backspace if decl.model.is_some() => {
+                    model.pop();
+                    self.new_session_picker = Some(PickerState::Options {
+                        kind,
+                        decl,
+                        model,
+                        effort_idx,
+                    });
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    if let Some(levels) = decl.effort {
+                        let states = levels.len() + 1; // index 0 = tool default
+                        effort_idx = if key.code == KeyCode::Right {
+                            (effort_idx + 1) % states
+                        } else {
+                            (effort_idx + states - 1) % states
+                        };
+                    }
+                    self.new_session_picker = Some(PickerState::Options {
+                        kind,
+                        decl,
+                        model,
+                        effort_idx,
+                    });
+                }
+                _ => {
+                    self.new_session_picker = Some(PickerState::Options {
+                        kind,
+                        decl,
+                        model,
+                        effort_idx,
+                    });
+                }
+            },
         }
     }
 
@@ -690,8 +928,11 @@ impl App {
         if self.show_keymap_overlay {
             self.draw_keymap_overlay(frame, area);
         }
-        if let Some(picker) = self.new_session_picker {
+        if let Some(picker) = &self.new_session_picker {
             self.draw_new_session_picker(frame, area, picker);
+        }
+        if let Some(pal) = &self.palette {
+            self.draw_palette(frame, area, pal);
         }
         if let Some(action) = self.pending_confirm {
             self.draw_confirm(frame, area, action);
@@ -709,7 +950,7 @@ impl App {
             };
             frame.render_widget(
                 Paragraph::new(
-                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  d detach  x close  r refresh  ? help  q quit",
+                    "AWAITING COMMAND — h/0 Home  1-9 jump  n/p cycle  c new  : palette  d detach  x close  r refresh  ? help  q quit",
                 )
                 .style(Style::default().add_modifier(Modifier::REVERSED)),
                 banner_area,
@@ -735,6 +976,7 @@ impl App {
             Line::from("  1-9     Jump to tab N"),
             Line::from("  n / p   Next / previous tab"),
             Line::from("  c       New session"),
+            Line::from("  :       Command palette (session tab)"),
             Line::from("  d       Detach"),
             Line::from("  x       Close tab (confirm)"),
             Line::from("  r       Refresh roster"),
@@ -749,36 +991,136 @@ impl App {
         frame.render_widget(Paragraph::new(text).block(block), popup);
     }
 
-    fn draw_new_session_picker(&self, frame: &mut Frame, area: Rect, picker: NewSessionPicker) {
-        let popup = centered_rect(50, 40, area);
+    fn draw_new_session_picker(&self, frame: &mut Frame, area: Rect, picker: &PickerState) {
+        match picker {
+            PickerState::ChooseTool { selected } => {
+                let popup = centered_rect(50, 40, area);
+                frame.render_widget(Clear, popup);
+
+                let kinds = adapters::registry();
+                let items: Vec<ListItem> = kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, kind)| {
+                        let installed = matches!(self.probe_cache.get(kind), Some(Ok(_)));
+                        let label = if installed {
+                            kind.display_name().to_string()
+                        } else {
+                            format!("{} (not installed)", kind.display_name())
+                        };
+                        let mut style = if installed {
+                            Style::default()
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+                        if i == *selected {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        ListItem::new(label).style(style)
+                    })
+                    .collect();
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("New session — Enter to select, Esc to cancel");
+                frame.render_widget(List::new(items).block(block), popup);
+            }
+            PickerState::Options {
+                kind,
+                decl,
+                model,
+                effort_idx,
+            } => {
+                let popup = centered_rect(60, 34, area);
+                frame.render_widget(Clear, popup);
+
+                let mut lines: Vec<Line> = Vec::new();
+                if let Some(suggestions) = decl.model {
+                    lines.push(Line::from(format!("Model:  {model}▏")));
+                    let hint = if suggestions.is_empty() {
+                        "free text — empty keeps the tool's default".to_string()
+                    } else {
+                        format!(
+                            "free text — e.g. {}; empty keeps the default",
+                            suggestions.join(", ")
+                        )
+                    };
+                    lines.push(Line::from(format!("        ({hint})")));
+                    lines.push(Line::from(""));
+                }
+                if let Some(levels) = decl.effort {
+                    let shown = if *effort_idx == 0 {
+                        "(default)"
+                    } else {
+                        levels[*effort_idx - 1]
+                    };
+                    lines.push(Line::from(format!("Effort: ◀ {shown} ▶")));
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from("Enter launch · ←/→ effort · Esc back"));
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("New session — {}", kind.display_name()));
+                frame.render_widget(Paragraph::new(lines).block(block), popup);
+            }
+        }
+    }
+
+    fn draw_palette(&self, frame: &mut Frame, area: Rect, pal: &palette::PaletteState) {
+        let popup = centered_rect(64, 60, area);
         frame.render_widget(Clear, popup);
 
-        let kinds = adapters::registry();
-        let items: Vec<ListItem> = kinds
-            .iter()
-            .enumerate()
-            .map(|(i, kind)| {
-                let installed = matches!(self.probe_cache.get(kind), Some(Ok(_)));
-                let label = if installed {
-                    kind.display_name().to_string()
-                } else {
-                    format!("{} (not installed)", kind.display_name())
-                };
-                let mut style = if installed {
-                    Style::default()
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                if i == picker.selected {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
-                ListItem::new(label).style(style)
-            })
-            .collect();
+        // Argument sub-stage: one entry, one free-text line, the tool's hint.
+        if let Some(args) = &pal.args {
+            let entry = &pal.entries[args.command_index];
+            let lines = vec![
+                Line::from(format!("{} {}▏", entry.inject, args.text)),
+                Line::from(""),
+                Line::from(format!("({})", entry.args_hint.unwrap_or(""))),
+                Line::from(""),
+                Line::from("Enter inject · empty = bare command · Esc back"),
+            ];
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{} — arguments", entry.name));
+            frame.render_widget(Paragraph::new(lines).block(block), popup);
+            return;
+        }
+
+        let filtered = palette::filtered_indices(pal.entries, &pal.filter);
+        let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(format!(
+            "› {}▏   (type to filter · ↑/↓ · Enter · Esc)",
+            pal.filter
+        )))];
+        items.extend(filtered.iter().enumerate().map(|(row, &entry_index)| {
+            let entry = &pal.entries[entry_index];
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:<14}", entry.name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.description),
+            ];
+            if entry.persists {
+                spans.push(Span::styled(
+                    "  [persists]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            let mut style = Style::default();
+            if row == pal.selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            ListItem::new(Line::from(spans)).style(style)
+        }));
+        if filtered.is_empty() {
+            items.push(ListItem::new("  (no matching command)"));
+        }
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("New session — Enter to launch, Esc to cancel");
+            .title(format!("Commands — {}", pal.tool_display));
         frame.render_widget(List::new(items).block(block), popup);
     }
 
@@ -875,4 +1217,160 @@ pub async fn run(config: SwarmTuiConfig) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::LaunchOptionsDecl;
+
+    #[test]
+    fn build_launch_options_maps_empty_fields_to_none() {
+        const LEVELS: &[&str] = &["low", "high"];
+        let decl = LaunchOptionsDecl {
+            model: Some(&[]),
+            effort: Some(LEVELS),
+        };
+        // Nothing chosen → nothing sent.
+        let opts = build_launch_options("", 0, &decl);
+        assert_eq!(opts, adapters::LaunchOptions::default());
+        // Whitespace is not a model.
+        assert_eq!(build_launch_options("   ", 0, &decl).model, None);
+        // Chosen values map through (effort_idx is 1-based over the decl).
+        let opts = build_launch_options("  opus ", 2, &decl);
+        assert_eq!(opts.model.as_deref(), Some("opus"));
+        assert_eq!(opts.effort.as_deref(), Some("high"));
+        // Undeclared fields never materialize, whatever the form held.
+        let opts = build_launch_options("opus", 1, &LaunchOptionsDecl::NONE);
+        assert_eq!(opts, adapters::LaunchOptions::default());
+    }
+
+    // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
+
+    fn test_record(id: u64, tool: &str) -> SessionRecord {
+        SessionRecord {
+            id,
+            tool: tool.to_string(),
+            native_id: None,
+            name: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: SessionMode::Interactive,
+            status: SessionStatus::Running,
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+            cost_usd: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// An `App` with one registered session backed by a fake `sh -c cat`
+    /// pane. Session id 1; the session tab is NOT promoted (tests do that).
+    fn app_with_cat_pane(tool: &str) -> (App, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = Registry::open(&tmp.path().join("registry.db")).expect("open registry");
+        // Dropping the change-notification receiver is fine: reader threads
+        // send best-effort (`let _ =`) and nothing here polls redraws.
+        let (mut pane_host, _pane_changed_rx) = LocalPaneHost::new();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("cat");
+        let pane_id = pane_host
+            .spawn(cmd, PaneSize { rows: 24, cols: 80 })
+            .expect("spawn fake pane");
+
+        let record = test_record(1, tool);
+        let app = App {
+            tabs: Tabs::new(),
+            registry,
+            pane_host,
+            pane_of_session: HashMap::from([(1, pane_id)]),
+            home: HomeView::new(vec![RosterEntry::Registered(record)]),
+            input_mode: InputMode::Normal,
+            probe_cache: HashMap::new(),
+            pending_confirm: None,
+            new_session_picker: None,
+            palette: None,
+            show_keymap_overlay: false,
+            pane_area_size: PaneSize { rows: 24, cols: 80 },
+        };
+        (app, tmp)
+    }
+
+    #[test]
+    fn colon_opens_palette_only_for_live_session_tab() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+
+        // Home tab active → no-op.
+        app.open_palette();
+        assert!(app.palette.is_none());
+
+        // Session tab with a live pane and a known tool → opens.
+        app.tabs.promote(1);
+        app.open_palette();
+        let pal = app.palette.as_ref().expect("palette should open");
+        assert_eq!(
+            pal.entries.len(),
+            AdapterKind::ClaudeCode.command_table().len()
+        );
+        app.palette = None;
+
+        // Unknown tool slug → no-op (from_slug fails; nothing to list).
+        let (mut alien, _tmp2) = app_with_cat_pane("mystery-tool");
+        alien.tabs.promote(1);
+        alien.open_palette();
+        assert!(alien.palette.is_none());
+
+        // Exited pane → no-op.
+        let pane_id = app.pane_of_session[&1];
+        app.pane_host.kill(pane_id).expect("kill fake pane");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.pane_host.is_exited(pane_id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.open_palette();
+        assert!(app.palette.is_none());
+    }
+
+    #[tokio::test]
+    async fn palette_enter_injects_the_selected_command_into_the_pane() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        app.tabs.promote(1);
+
+        let press = |code: KeyCode, mods: KeyModifiers| KeyEvent::new(code, mods);
+
+        // Prefix, then ':' opens the palette on the session tab.
+        app.handle_key(press(KeyCode::Char(' '), KeyModifiers::CONTROL))
+            .await;
+        app.handle_key(press(KeyCode::Char(':'), KeyModifiers::NONE))
+            .await;
+        assert!(app.palette.is_some());
+
+        // Filter down to /status (no args_hint → Enter injects directly).
+        for c in "status".chars() {
+            app.handle_key(press(KeyCode::Char(c), KeyModifiers::NONE))
+                .await;
+        }
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert!(app.palette.is_none(), "palette closes after injecting");
+
+        // The fake pane must have received and echoed "/status" + CR.
+        let pane_id = app.pane_of_session[&1];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            seen = app
+                .pane_host
+                .with_screen(pane_id, |s| s.contents())
+                .expect("screen");
+            if seen.contains("/status") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            seen.contains("/status"),
+            "injected command never reached the pane; screen:\n{seen}"
+        );
+    }
 }

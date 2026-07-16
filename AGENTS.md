@@ -1,11 +1,13 @@
 # swarm-tui
 
-Terminal orchestrator (Rust, ratatui) that wraps the locally installed Claude Code,
-Antigravity CLI (`agy`), and Codex CLI: per-service interactive session tabs plus a home
-view that routes cross-agent work. Maturity: **early implementation** — docs, module
-stubs compiling against the pinned deps, and a passed ADR-0003 fidelity spike
-(2026-07-05); no runnable orchestration logic yet. The single thing an agent must never break: **swarm-tui reuses the
-three CLIs' existing local logins and config; it must never trigger a new auth flow or
+Terminal orchestrator (Rust, ratatui) that wraps the locally installed Claude Code
+and Antigravity CLI (`agy`): per-service interactive session tabs plus a home view
+that routes cross-agent work. The Codex CLI integration is **suspended**
+(ADR-0008) — its adapter stays compiled for reversal but is never probed, offered,
+or spawned. Maturity: **early implementation** — the milestone-2a shell is real
+(`cargo run` boots tabs, roster, and live PTY sessions); no headless orchestration
+logic yet. The single thing an agent must never break: **swarm-tui reuses the
+wrapped CLIs' existing local logins and config; it must never trigger a new auth flow or
 read, print, or copy the contents of any credential file** (`~/.codex/auth.json`,
 anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that these paths
 *exist* is fine; their contents are off-limits.
@@ -41,7 +43,9 @@ anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that the
 - Architecture changes require a new ADR (`docs/adr/000N-title.md`); supersede, never
   edit, an accepted ADR.
 - Everything CLI-specific stays inside its adapter module. `core` and `app` may only
-  speak `AgentEvent`, `SessionRecord`, and `AdapterCaps`.
+  speak `AgentEvent`, `SessionRecord`, `AdapterCaps`, and the data-only
+  launch/command vocabulary `LaunchIntent`, `LaunchOptions`, `NativeCommand`
+  (ADR-0009). Flag names and per-tool semantics never leave `src/adapters/`.
 - Facts about the three CLIs go in `docs/integrations/` with a verified/unverified
   marker and a date — never inline in code comments alone.
 
@@ -63,9 +67,9 @@ anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that the
 
 ## Gotchas
 
-- `agy -p` has **no structured-output flag** (confirmed locally at v1.0.14,
-  2026-07-05) — the Antigravity programmatic channel is plain text; don't assume JSON
-  parity with the other two.
+- `agy -p` has **no structured-output flag** (confirmed locally at v1.0.14
+  2026-07-05 and v1.1.3 2026-07-16) — the Antigravity programmatic channel is plain
+  text; don't assume JSON parity with Claude Code.
 - `claude -p --resume <id>` resolves session IDs **scoped to the current project
   directory and its worktrees** — dispatch and resume must run from the same cwd.
 - `claude --bare` skips OAuth/keychain reads and needs an API key — it breaks the

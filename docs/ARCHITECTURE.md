@@ -7,17 +7,19 @@ facts are sourced in `docs/integrations/`. This page describes how the pieces fi
 
 A single Rust binary presenting a tabbed terminal UI. One tab is the **home view**
 (cross-agent roster, dispatch, broadcast). Every other tab is a **live interactive
-session** of one underlying CLI — the real `claude`, `agy`, or `codex` process running
-in a PTY that swarm-tui owns and renders. Between the UI and the tools sits one trait,
-`CliAdapter`, with three implementations. Underneath everything is a thin SQLite
-registry that remembers which native session ID lives behind which tab, so work can move
-between headless dispatch and interactive attention without losing the thread.
+session** of one underlying CLI — the real `claude` or `agy` process running in a PTY
+that swarm-tui owns and renders (the `codex` integration is suspended — ADR-0008).
+Between the UI and the tools sits one trait, `CliAdapter`, with one implementation
+per tool (two active, one suspended-but-compiled). Underneath everything is a thin
+SQLite registry that remembers which native session ID lives behind which tab, so
+work can move between headless dispatch and interactive attention without losing the
+thread.
 
 ## Components
 
 | Component | Module | Responsibility | Knows about CLIs? |
 | --- | --- | --- | --- |
-| TUI shell | `src/app/` | tab bar, keymap, layout, rendering loop | no |
+| TUI shell | `src/app/` | tab bar, keymap, command palette, layout, rendering loop | no |
 | Home view | `src/app/home.rs` | roster, task input, dispatch/broadcast UI, event timeline | no |
 | Session view | `src/app/session_view.rs` | renders one PTY grid, forwards keystrokes | no |
 | Task router | `src/core/task.rs` | maps a home-view task to target adapter(s) + guardrails | capability level only |
@@ -27,6 +29,26 @@ between headless dispatch and interactive attention without losing the thread.
 | Registry | `src/store/` | SQLite: swarm-tui session ↔ native session ID + metadata | schema only |
 | Capability probe | `src/adapters/mod.rs` | startup `--version`/`--help` checks → `AdapterCaps` | yes |
 
+## The command plane (ADR-0007, ADR-0009)
+
+Input routing reserves exactly one key: **Ctrl-Space**, the one-shot prefix
+(ADR-0007). Everything else flows to the focused surface — the wrapped TUI on a
+session tab, row navigation on Home. On top of that sit three layers (ADR-0009):
+
+- **Layer 0 — native passthrough.** Slash commands typed inside a pane go straight
+  to the tool; swarm-tui never intercepts or parses them.
+- **Layer 1 — command palette.** Prefix + `:` on a session tab lists that tool's
+  locally-verified native commands (`CliAdapter::command_table()`, populated from
+  `docs/integrations/command-surfaces.md`) and injects the selection — command text
+  plus carriage return — through the same write path as ordinary keystrokes; the
+  tool's own UI takes over. Entries with cross-session effects carry a `[persists]`
+  badge; entries declaring an args hint offer a free-text argument line first.
+- **Layer 2 — launch options.** The new-session picker renders a per-tool options
+  form (model / effort) declared by `AdapterCaps.launch` — probe-gated on the
+  installed binary's `--help`, so upstream flag drift hides a field instead of
+  breaking a spawn. Choices persist on the session row (registry schema v2) and
+  show in the roster and the session status line.
+
 ## Implementation status
 
 As of this milestone (Stages A1–E, 2026-07-15): the registry (`src/store/`), the
@@ -35,6 +57,18 @@ PTY layer (`src/pty/`), the app shell (`src/app/`), and Claude Code reconciliati
 terminal shell with tabs, a home roster, and live PTY sessions. `CliAdapter::
 dispatch()`/`follow_up()` (headless dispatch), broadcast, pipelines, and MCP
 integration are still not implemented — deferred to a later milestone.
+
+**Codex CLI is suspended as of 2026-07-16 (ADR-0008):** its adapter stays compiled
+(enum variant, module, dispatch arms all intact) but `registry()` no longer lists
+it, so it is never probed, offered in the new-session picker, or spawned. Historical
+`tool = "codex"` registry rows render read-only in the roster. Codex mentions
+elsewhere on this page (channel tables, guardrail defaults, failure modes) remain as
+recorded design for the reversal path.
+
+**Milestone 2b (the command plane) is implemented as of 2026-07-16:** the command
+palette, per-tool launch options, and registry schema v2 (`model`/`effort` columns
+with a real v1→v2 migration) are live — see "The command plane" above and
+ADR-0009.
 
 ## The two channels (ADR-0001)
 

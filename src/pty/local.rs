@@ -123,12 +123,25 @@ impl PaneHost for LocalPaneHost {
                     }
                     _ => {
                         reader_exited.store(true, Ordering::SeqCst);
-                        let status = reader_child.lock().unwrap().try_wait();
-                        let success = match status {
-                            Ok(Some(status)) => Some(status.success()),
-                            _ => Some(false),
-                        };
-                        *reader_exit_success.lock().unwrap() = success;
+                        // PTY EOF can land before the kernel has the child's
+                        // exit status ready — a single try_wait() here raced
+                        // and misreported clean exits as failures. Poll
+                        // briefly (lock released between polls so kill() can
+                        // interleave); a child still alive after the window
+                        // stays conservatively "failed", same as before.
+                        let mut success = None;
+                        for _ in 0..100 {
+                            match reader_child.lock().unwrap().try_wait() {
+                                Ok(Some(status)) => {
+                                    success = Some(status.success());
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(_) => break,
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        *reader_exit_success.lock().unwrap() = Some(success.unwrap_or(false));
                         let _ = reader_changed_tx.send(pane_id);
                         break;
                     }

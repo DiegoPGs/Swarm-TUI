@@ -14,6 +14,19 @@ Behavioral ⬜ items stay open deliberately: settling them means live dispatches
 write to the user's real conversation store — run those supervised, not from an
 unattended session.
 
+**Local re-check 2026-07-16: installed version is now v1.1.3.** Flag surface at
+1.1.3 (`agy --help` ✅): everything from the v1.0.14 list below **plus** `--agent`
+(1.1.1), `--mode` (`accept-edits`, `plan` — execution-mode cycling
+`default → accept-edits → plan` via shift+tab, `request-review` default, 1.1.0) and
+the `agent`/`agents` subcommands. Still **no structured-output flag** (ADR-0001
+revisit trigger not fired) and still no `--resume` — `--conversation` remains the
+resume path. `agy models` ✅ lists 8 model variants (names carry a reasoning level,
+e.g. "Gemini 3.1 Pro (High)"). The complete in-TUI slash-command surface at 1.1.3 —
+including `/goal` and `/schedule`, now ✅ *(local 2026-07-16)*, upgrading the 🔶
+below — lives in [`command-surfaces.md`](command-surfaces.md), observed via
+`examples/slash_probe.rs` after the owner-authorized workspace-trust accept for
+this repo (recorded in NOTES.md).
+
 ## Identity & lineage
 
 - ✅ Announced 2026-05-19 as the successor to Gemini CLI; legacy Gemini CLI shut down

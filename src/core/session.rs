@@ -29,6 +29,10 @@ pub struct SessionRecord {
     pub updated_at: SystemTime,
     /// Cumulative reported cost, where the tool reports one (claude).
     pub cost_usd: Option<f64>,
+    /// Launch options the session was spawned with (ADR-0009, registry schema
+    /// v2). `None` for sessions predating v2 or launched with tool defaults.
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
