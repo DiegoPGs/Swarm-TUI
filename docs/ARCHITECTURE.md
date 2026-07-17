@@ -22,7 +22,7 @@ thread.
 | TUI shell | `src/app/` | tab bar, keymap, command palette, layout, rendering loop | no |
 | Home view | `src/app/home.rs` | roster, task input, dispatch/broadcast UI, event timeline | no |
 | Resources view | `src/app/usage.rs` | per-vendor usage captures + hidden probe panes (ADR-0011) | no (concept key `/usage` only) |
-| Swarm plan | `src/core/plan.rs` | load/validate `.swarm/swarm.json` roles (ADR-0010) | no (slug lists passed in) |
+| Swarm plan | `src/core/plan.rs` | load/validate/merge `.swarm/swarm.json` + `.swarm/swarm.local.json` — roles and defaults (ADR-0010, ADR-0012) | no (slug lists passed in) |
 | Startup queue | `src/app/startup.rs` | role startup-command injection: paint wait, echo guard, confirm | no |
 | Session view | `src/app/session_view.rs` | renders one PTY grid, forwards keystrokes | no |
 | Task router | `src/core/task.rs` | maps a home-view task to target adapter(s) + guardrails | capability level only |
@@ -52,9 +52,10 @@ session tab, row navigation on Home. On top of that sit three layers (ADR-0009):
   breaking a spawn. Choices persist on the session row (registry schema v2) and
   show in the roster and the session status line.
 
-## The swarm plan and the Resources view (ADR-0010, ADR-0011)
+## The swarm plan and the Resources view (ADR-0010, ADR-0011, ADR-0012)
 
-Milestone 2c adds workspace resource planning on top of the command plane:
+Milestone 2c adds workspace resource planning on top of the command plane;
+milestone 2d grows the plan into per-project personalization:
 
 - **Roles** (`.swarm/swarm.json`, committed and shareable): named launch presets —
   tool, model/effort (verbatim, no translation), purpose, startup commands. The
@@ -67,6 +68,18 @@ Milestone 2c adds workspace resource planning on top of the command plane:
   `role` column (schema v3) records what was requested. `core/plan.rs` validates
   strictly (unknown/suspended tools, non-slash commands, versions) and a broken file
   degrades to a one-line picker error, never a crash.
+- **Defaults & the personal overlay** (schema v2, ADR-0012): the committed file
+  may add a `defaults` object — `default_role` (picker preselect), `broadcast`
+  (role names a broadcast targets by default; naming a role is the explicit
+  opt-in for its tool, which keeps quota-shared agy out unless named),
+  `dispatch` (neutral guardrail preferences — posture/limits — that only
+  tighten or select among the normative table below; adapters map them to
+  flags at dispatch time), and `worktrees` (`in_place` now, `per_task`
+  reserved). A gitignored `.swarm/swarm.local.json` overlays the committed
+  file per named entry (role names, defaults fields), local winning wholesale
+  per entry. A broken layer fails the whole load with an error naming the
+  offending file — never a partial merge. Broadcast/dispatch *behavior* is
+  milestone 3; 2d loads, validates, and carries the preferences.
 - **Resources view** (prefix+`u`, Home tab body): one block per active vendor —
   the plan's role assignments, the vendor's own usage screen captured VERBATIM, a
   best-effort `%` headline, and a relative "as of Xm ago" timestamp. Refresh is
@@ -103,6 +116,14 @@ ADR-0009.
 injection, the prefix+`u` Resources view with hidden usage probes, and registry
 schema v3 (`role` column; v1 databases migrate through a v1→v2→v3 chain) — see
 "The swarm plan and the Resources view" above, ADR-0010, and ADR-0011.
+
+**Milestone 2d (workspace personalization) is implemented as of 2026-07-17:**
+plan schema v2 (`defaults`: picker preselect, broadcast set, dispatch
+guardrail preferences, worktree policy slot) and the personal
+`.swarm/swarm.local.json` overlay with per-entry shallow merge — see the
+defaults bullet above and ADR-0012. Schema-v1 files keep loading unchanged;
+no registry change. The `broadcast` and `dispatch` preferences are loaded and
+validated but consumed only when milestone 3 lands those features.
 
 ## The two channels (ADR-0001)
 
