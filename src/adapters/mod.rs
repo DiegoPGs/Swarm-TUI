@@ -136,6 +136,7 @@ pub struct NativeCommand {
 /// only ever polls `events` on its render tick and, at most, fires `kill`.
 /// Decided in ADR-0013: this stays a std `mpsc` receiver polled by the tick;
 /// no async trait.
+#[derive(Debug)]
 pub struct DispatchHandle {
     pub events: Receiver<AgentEvent>,
     pub kill: DispatchKill,
@@ -143,7 +144,7 @@ pub struct DispatchHandle {
 
 /// Best-effort stop for a dispatched child. Cloneable so the app can hold
 /// one while the reader thread keeps reaping through the same shared child.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DispatchKill(Arc<Mutex<Child>>);
 
 impl DispatchKill {
@@ -486,6 +487,22 @@ pub(crate) fn help_text(binary: &str, args: &[&str]) -> String {
             String::from_utf8_lossy(&out.stderr)
         ),
         Err(_) => String::new(),
+    }
+}
+
+/// Test-only handle factory: a real receiver whose sender the test holds,
+/// and a kill lever backed by a trivial already-exiting `sh` child — app
+/// tests hand-feed events without ever spawning a wrapped CLI.
+#[cfg(test)]
+pub(crate) fn test_dispatch_handle(events: Receiver<AgentEvent>) -> DispatchHandle {
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(":")
+        .spawn()
+        .expect("spawn trivial child for test handle");
+    DispatchHandle {
+        events,
+        kill: DispatchKill(Arc::new(Mutex::new(child))),
     }
 }
 

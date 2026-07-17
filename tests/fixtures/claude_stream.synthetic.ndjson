@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-555555555555","model":"claude-fable-5","cwd":"/home/user/project","tools":["Read","Glob","Grep"]}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Looking at the repo layout first."}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_synth_01","name":"Read","input":{"file_path":"README.md"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_synth_01","content":"# synthetic readme"}]}}
+this line is deliberate non-JSON noise from --verbose
+{"type":"future_event_kind","payload":{"answer":42}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done: two findings, both minor."}]}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":6100,"num_turns":3,"result":"Two findings, both minor.","total_cost_usd":0.0421,"session_id":"11111111-2222-4333-8444-555555555555"}

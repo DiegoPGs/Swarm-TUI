@@ -40,8 +40,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT, effort TEXT, role TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_tool_native ON sessions(tool, native_id);
--- Unused this milestone (dispatch()/follow_up() adapter methods stay todo!() elsewhere
--- in the codebase); exists now so a later milestone doesn't need a schema migration for it.
+-- Dispatch provenance/history (ADR-0013): written by record_dispatch /
+-- finalize_dispatch since milestone 3; pre-created in 2a so no migration was needed.
 CREATE TABLE IF NOT EXISTS dispatches (
     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER REFERENCES sessions(id),
     tool TEXT NOT NULL, prompt TEXT NOT NULL, cwd TEXT NOT NULL,
@@ -264,6 +264,82 @@ impl Registry {
         Ok(records)
     }
 
+    /// First writer of the pre-created `dispatches` table (ADR-0013): one
+    /// row per headless dispatch, inserted at spawn; `finalize_dispatch`
+    /// completes it on the terminal event. Returns the dispatch row id.
+    pub fn record_dispatch(
+        &mut self,
+        session_id: u64,
+        tool: &str,
+        prompt: &str,
+        cwd: &Path,
+    ) -> Result<u64, StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO dispatches (session_id, tool, prompt, cwd, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session_id as i64,
+                    tool,
+                    prompt,
+                    cwd.to_string_lossy(),
+                    system_time_to_unix(SystemTime::now()),
+                ],
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid() as u64)
+    }
+
+    pub fn finalize_dispatch(
+        &mut self,
+        dispatch_id: u64,
+        outcome: &str,
+        cost_usd: Option<f64>,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE dispatches SET finished_at = ?1, outcome = ?2, cost_usd = ?3
+                 WHERE id = ?4",
+                params![
+                    system_time_to_unix(SystemTime::now()),
+                    outcome,
+                    cost_usd,
+                    dispatch_id as i64,
+                ],
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Recent dispatch history, newest first (test + timeline surface).
+    pub fn dispatch_history(&self, limit: usize) -> Result<Vec<DispatchRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, tool, prompt, outcome, cost_usd, finished_at
+                 FROM dispatches ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok(DispatchRow {
+                    id: row.get::<_, i64>(0)? as u64,
+                    session_id: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                    tool: row.get(2)?,
+                    prompt: row.get(3)?,
+                    outcome: row.get(4)?,
+                    cost_usd: row.get(5)?,
+                    finished: row.get::<_, Option<i64>>(6)?.is_some(),
+                })
+            })
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| StoreError::Query(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
     /// Mark rows whose native sessions vanished. Takes the *found* native ids
     /// per tool so the store stays ignorant of how discovery works.
     ///
@@ -331,6 +407,18 @@ fn status_from_str(s: &str) -> Result<SessionStatus, StoreError> {
             "unrecognized session status in registry: {other:?}"
         ))),
     }
+}
+
+/// One `dispatches` row (ADR-0013 provenance/history; not a session record).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatchRow {
+    pub id: u64,
+    pub session_id: Option<u64>,
+    pub tool: String,
+    pub prompt: String,
+    pub outcome: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub finished: bool,
 }
 
 #[derive(Debug)]
@@ -570,6 +658,38 @@ INSERT INTO schema_version (version) VALUES (2);
             Ok(_) => panic!("must refuse a newer schema"),
         };
         assert!(matches!(err, StoreError::Open(msg) if msg.contains("v99")));
+    }
+
+    #[test]
+    fn dispatch_rows_record_and_finalize() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut registry = Registry::open(&tmp.path().join("registry.db")).expect("open");
+        let sid = registry.create(&sample_record(0)).expect("create session");
+        let did = registry
+            .record_dispatch(
+                sid,
+                "claude-code",
+                "review the diff",
+                Path::new("/tmp/repo"),
+            )
+            .expect("record dispatch");
+
+        let rows = registry.dispatch_history(10).expect("history");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, did);
+        assert_eq!(rows[0].session_id, Some(sid));
+        assert_eq!(rows[0].tool, "claude-code");
+        assert_eq!(rows[0].prompt, "review the diff");
+        assert!(!rows[0].finished);
+        assert_eq!(rows[0].outcome, None);
+
+        registry
+            .finalize_dispatch(did, "completed", Some(0.05))
+            .expect("finalize");
+        let rows = registry.dispatch_history(10).expect("history");
+        assert!(rows[0].finished);
+        assert_eq!(rows[0].outcome.as_deref(), Some("completed"));
+        assert_eq!(rows[0].cost_usd, Some(0.05));
     }
 
     #[test]

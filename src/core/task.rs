@@ -55,6 +55,30 @@ pub enum DispatchPosture {
     Edits,
 }
 
+/// Router precedence (ADR-0013): the normative conservative defaults
+/// (`Budget::default()`, i.e. the ARCHITECTURE table's posture) ← the
+/// workspace's `defaults.dispatch` (ADR-0012) ← per-task edits, which the
+/// dispatch form applies on the value this returns.
+pub fn budget_from_workspace(prefs: Option<&crate::core::plan::DispatchPrefs>) -> Budget {
+    let mut budget = Budget::default();
+    let Some(prefs) = prefs else {
+        return budget;
+    };
+    if let Some(posture) = prefs.posture {
+        budget.posture = posture;
+    }
+    if let Some(turns) = prefs.max_turns {
+        budget.max_turns = Some(u32::try_from(turns).unwrap_or(u32::MAX));
+    }
+    if let Some(usd) = prefs.max_budget_usd {
+        budget.max_usd = Some(usd);
+    }
+    if let Some(secs) = prefs.timeout_secs {
+        budget.timeout_secs = Some(secs);
+    }
+    budget
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +90,26 @@ mod tests {
         assert_eq!(budget.max_turns, None);
         assert_eq!(budget.max_usd, None);
         assert_eq!(budget.timeout_secs, None);
+    }
+
+    #[test]
+    fn workspace_dispatch_prefs_override_the_normative_defaults() {
+        use crate::core::plan::DispatchPrefs;
+
+        // No workspace prefs → the conservative defaults.
+        assert_eq!(budget_from_workspace(None).posture, DispatchPosture::Plan);
+
+        // Set fields override; unset fields keep the default.
+        let prefs = DispatchPrefs {
+            posture: Some(DispatchPosture::ReadOnly),
+            max_turns: Some(12),
+            max_budget_usd: None,
+            timeout_secs: Some(120),
+        };
+        let budget = budget_from_workspace(Some(&prefs));
+        assert_eq!(budget.posture, DispatchPosture::ReadOnly);
+        assert_eq!(budget.max_turns, Some(12));
+        assert_eq!(budget.max_usd, None);
+        assert_eq!(budget.timeout_secs, Some(120));
     }
 }

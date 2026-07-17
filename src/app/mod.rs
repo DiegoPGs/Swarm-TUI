@@ -12,6 +12,7 @@
 //! appears here, the adapter boundary (ADR-0006) has leaked — fix the
 //! boundary, not this module.
 
+pub mod dispatch;
 pub mod home;
 pub mod keys;
 pub mod palette;
@@ -41,6 +42,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use crate::adapters::claude_code::ClaudeCode;
 use crate::adapters::{self, AdapterCaps, AdapterError, AdapterKind, CliAdapter};
 use crate::core::config::SwarmTuiConfig;
+use crate::core::events::AgentEvent;
 use crate::core::plan::{Role, SwarmPlan};
 use crate::core::session::{SessionMode, SessionRecord, SessionStatus};
 use crate::pty::local::LocalPaneHost;
@@ -173,6 +175,16 @@ pub enum PickerState {
         /// 0 = tool default (send nothing); 1.. indexes `decl.effort`.
         effort_idx: usize,
     },
+}
+
+/// Truncate for one-line surfaces (timeline rows), char-boundary safe.
+fn truncate_line(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
 }
 
 fn is_ctrl_space(key: &KeyEvent) -> bool {
@@ -331,6 +343,13 @@ pub struct App {
     /// tab bar row. Recomputed every `draw()` call so it tracks real resizes
     /// without needing a dedicated `Event::Resize` handler.
     pane_area_size: PaneSize,
+    /// Live + finished headless dispatches, keyed by their registry session
+    /// id (ADR-0013); events fold in on the tick via `drive_dispatches`.
+    pub dispatches: HashMap<SessionId, dispatch::RunningDispatch>,
+    /// The Home-local dispatch form (`i`), when open.
+    pub dispatch_form: Option<dispatch::DispatchForm>,
+    /// Recent dispatch activity one-liners for the Home timeline panel.
+    pub timeline: std::collections::VecDeque<String>,
 }
 
 /// Query Claude Code's native background-agent supervisor (ADR-0002
@@ -439,6 +458,9 @@ impl App {
                 usage: HashMap::new(),
                 probes: HashMap::new(),
                 pane_area_size,
+                dispatches: HashMap::new(),
+                dispatch_form: None,
+                timeline: std::collections::VecDeque::new(),
             },
             pane_changed_rx,
         ))
@@ -674,6 +696,10 @@ impl App {
             self.handle_palette_key(key);
             return false;
         }
+        if self.dispatch_form.is_some() {
+            self.handle_dispatch_form_key(key);
+            return false;
+        }
         if self.show_keymap_overlay {
             // Any key dismisses the overlay; ADR-0007 leaves the exact
             // indicator/dismiss UX to the implementation. Swallow the
@@ -739,6 +765,7 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.home.select_prev(),
             KeyCode::Down | KeyCode::Char('j') => self.home.select_next(),
+            KeyCode::Char('i') => self.open_dispatch_form(),
             KeyCode::Enter => {
                 if let Some(session_id) = self.home.selected_session_id() {
                     if home::is_detached(session_id, &self.pane_of_session, &self.tabs) {
@@ -747,6 +774,258 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Home-local `i` (ADR-0013): open the dispatch form, prefilled from the
+    /// workspace's `defaults.dispatch` and preselecting `default_role`.
+    fn open_dispatch_form(&mut self) {
+        let targets = dispatch::targets(self.plan.as_ref(), |kind| {
+            matches!(self.probe_cache.get(&kind), Some(Ok(_)))
+        });
+        if targets.iter().all(|t| !t.enabled) {
+            self.push_timeline("✗ dispatch: no installed tool to target".to_string());
+            return;
+        }
+        let budget = crate::core::task::budget_from_workspace(
+            self.plan
+                .as_ref()
+                .and_then(|plan| plan.defaults.dispatch.as_ref()),
+        );
+        let preselect = self
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.defaults.default_role.clone());
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.dispatch_form = Some(dispatch::DispatchForm::new(
+            targets,
+            preselect.as_deref(),
+            budget,
+            cwd,
+        ));
+    }
+
+    fn handle_dispatch_form_key(&mut self, key: KeyEvent) {
+        let Some(mut form) = self.dispatch_form.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {} // drop the form
+            KeyCode::Enter => match form.submit() {
+                Ok((target, task)) => self.start_dispatch(target, task),
+                Err(msg) => {
+                    form.error = Some(msg);
+                    self.dispatch_form = Some(form);
+                }
+            },
+            _ => {
+                form.handle_key(key);
+                self.dispatch_form = Some(form);
+            }
+        }
+    }
+
+    fn push_timeline(&mut self, line: String) {
+        self.timeline.push_back(line);
+        while self.timeline.len() > 200 {
+            self.timeline.pop_front();
+        }
+    }
+
+    /// Spawn one headless dispatch (ADR-0013): adapter builds and runs the
+    /// command; the registry gets a Headless/Running session row plus a
+    /// `dispatches` row; events fold in on the tick. Failures surface on the
+    /// timeline — never a crash.
+    fn start_dispatch(&mut self, target: dispatch::Target, task: crate::core::task::Task) {
+        let handle = match target.kind.dispatch(&task) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.push_timeline(format!("✗ {}: dispatch failed: {e:?}", target.kind.id()));
+                return;
+            }
+        };
+        let now = SystemTime::now();
+        let record = SessionRecord {
+            id: 0, // assigned by create()
+            tool: target.kind.id().to_string(),
+            native_id: None, // learned from the Started event
+            name: None,
+            cwd: task.cwd.clone(),
+            mode: SessionMode::Headless,
+            status: SessionStatus::Running,
+            created_at: now,
+            updated_at: now,
+            cost_usd: None,
+            model: task.model.clone(),
+            effort: task.effort.clone(),
+            role: target.role.clone(),
+        };
+        let session_id = match self.registry.create(&record) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("dispatch registry create failed: {e:?}");
+                self.push_timeline(format!("✗ registry error, dispatch aborted: {e:?}"));
+                handle.kill.kill();
+                return;
+            }
+        };
+        let dispatch_row = match self.registry.record_dispatch(
+            session_id,
+            target.kind.id(),
+            &task.prompt,
+            &task.cwd,
+        ) {
+            Ok(row) => Some(row),
+            Err(e) => {
+                tracing::warn!("dispatches insert failed: {e:?}");
+                None
+            }
+        };
+        self.dispatches.insert(
+            session_id,
+            dispatch::RunningDispatch {
+                handle,
+                done: false,
+                dispatch_row,
+            },
+        );
+        let label = target.role.as_deref().unwrap_or(target.kind.id());
+        self.push_timeline(format!(
+            "▸ #{session_id} {label}: {}",
+            truncate_line(&task.prompt, 60)
+        ));
+        let _ = self.refresh_roster();
+    }
+
+    /// Fold pending dispatch events into the registry, timeline, and roster
+    /// (ADR-0013). Called from the tick; returns true when anything changed.
+    fn drive_dispatches(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        // Pass 1: drain channels (mutably borrows the dispatch map only).
+        let mut folded: Vec<(SessionId, AgentEvent)> = Vec::new();
+        for (&session_id, disp) in self.dispatches.iter_mut() {
+            if disp.done {
+                continue;
+            }
+            loop {
+                match disp.handle.events.try_recv() {
+                    Ok(event) => {
+                        if matches!(
+                            event,
+                            AgentEvent::Completed { .. } | AgentEvent::Failed { .. }
+                        ) {
+                            disp.done = true;
+                        }
+                        folded.push((session_id, event));
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        if !disp.done {
+                            // The reader thread always sends a terminal
+                            // event; a bare disconnect means it died.
+                            disp.done = true;
+                            folded.push((
+                                session_id,
+                                AgentEvent::Failed {
+                                    reason: "event stream ended unexpectedly".to_string(),
+                                },
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Pass 2: apply (borrows registry/timeline freely).
+        let changed = !folded.is_empty();
+        let mut roster_dirty = false;
+        for (session_id, event) in folded {
+            match event {
+                AgentEvent::Started { native_id } => {
+                    if let Some(native_id) = native_id {
+                        self.update_session_row(session_id, |record| {
+                            record.native_id = Some(native_id.clone());
+                        });
+                        roster_dirty = true;
+                    }
+                    self.push_timeline(format!("· #{session_id} started"));
+                }
+                AgentEvent::AgentText(text) => {
+                    let first = text.lines().next().unwrap_or("");
+                    self.push_timeline(format!("· #{session_id} {}", truncate_line(first, 70)));
+                }
+                AgentEvent::ToolActivity(tool) => {
+                    self.push_timeline(format!("· #{session_id} [{tool}]"));
+                }
+                AgentEvent::Completed { result, cost_usd } => {
+                    self.update_session_row(session_id, |record| {
+                        record.status = SessionStatus::Completed;
+                        record.cost_usd = cost_usd;
+                    });
+                    self.finalize_dispatch_row(session_id, "completed", cost_usd);
+                    let cost = cost_usd.map(|c| format!(" (${c:.2})")).unwrap_or_default();
+                    self.push_timeline(format!(
+                        "✓ #{session_id} completed{cost}: {}",
+                        truncate_line(result.lines().next().unwrap_or(""), 60)
+                    ));
+                    roster_dirty = true;
+                }
+                AgentEvent::Failed { reason } => {
+                    self.update_session_row(session_id, |record| {
+                        record.status = SessionStatus::Failed;
+                    });
+                    self.finalize_dispatch_row(session_id, "failed", None);
+                    self.push_timeline(format!(
+                        "✗ #{session_id} failed: {}",
+                        truncate_line(reason.lines().next().unwrap_or(""), 60)
+                    ));
+                    roster_dirty = true;
+                }
+            }
+        }
+        if roster_dirty {
+            let _ = self.refresh_roster();
+        }
+        changed
+    }
+
+    /// Read-modify-upsert one session row; load failures are warned, never
+    /// fatal (findings-ledger F-002 stance).
+    fn update_session_row(
+        &mut self,
+        session_id: SessionId,
+        apply: impl FnOnce(&mut SessionRecord),
+    ) {
+        match self.registry.all() {
+            Ok(mut records) => {
+                if let Some(record) = records.iter_mut().find(|r| r.id == session_id) {
+                    apply(record);
+                    record.updated_at = SystemTime::now();
+                    if let Err(e) = self.registry.upsert(record) {
+                        tracing::warn!(session_id, "dispatch status write failed: {e:?}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(session_id, "dispatch registry read failed: {e:?}");
+            }
+        }
+    }
+
+    fn finalize_dispatch_row(&mut self, session_id: SessionId, outcome: &str, cost: Option<f64>) {
+        let Some(row) = self
+            .dispatches
+            .get(&session_id)
+            .and_then(|d| d.dispatch_row)
+        else {
+            return;
+        };
+        if let Err(e) = self.registry.finalize_dispatch(row, outcome, cost) {
+            tracing::warn!(session_id, "dispatch finalize failed: {e:?}");
         }
     }
 
@@ -854,7 +1133,8 @@ impl App {
                 self.show_keymap_overlay = !self.show_keymap_overlay;
             }
             KeyCode::Char('q') => {
-                if self.pane_of_session.is_empty() {
+                let dispatches_running = self.dispatches.values().any(|d| !d.done);
+                if self.pane_of_session.is_empty() && !dispatches_running {
                     // Session panes are gone; make sure no hidden probe pane
                     // outlives the app either (ADR-0011).
                     self.kill_probe_panes();
@@ -1003,13 +1283,32 @@ impl App {
             }
             ConfirmAction::Quit => {
                 // Fire-and-forget: a bulk quit-kill doesn't update registry
-                // status (out of scope for a clean-shutdown path) — just
-                // make sure nothing is left running, hidden probe panes
-                // included (ADR-0011).
+                // status for PANES (native transcripts persist and
+                // reconciliation re-adopts them) — just make sure nothing is
+                // left running, hidden probe panes included (ADR-0011).
                 for &pane_id in self.pane_of_session.values() {
                     let _ = self.pane_host.kill(pane_id);
                 }
                 self.kill_probe_panes();
+                // Headless dispatches DO get their rows closed (ADR-0013):
+                // nothing reconciles them yet, so a bare kill would leave
+                // zombie Running rows in the roster forever.
+                let running: Vec<SessionId> = self
+                    .dispatches
+                    .iter()
+                    .filter(|(_, d)| !d.done)
+                    .map(|(&id, _)| id)
+                    .collect();
+                for session_id in running {
+                    if let Some(disp) = self.dispatches.get_mut(&session_id) {
+                        disp.handle.kill.kill();
+                        disp.done = true;
+                    }
+                    self.update_session_row(session_id, |record| {
+                        record.status = SessionStatus::Failed;
+                    });
+                    self.finalize_dispatch_row(session_id, "stopped at quit", None);
+                }
                 true
             }
         }
@@ -1050,6 +1349,9 @@ impl App {
             self.usage.insert(kind, capture);
             changed = true;
         }
+
+        // Headless dispatch events (ADR-0013).
+        changed |= self.drive_dispatches();
         changed
     }
 
@@ -1273,7 +1575,18 @@ impl App {
                     );
                 } else {
                     let detached = self.detached_set();
-                    home::render_home(frame, body_area, &self.home, &detached);
+                    if self.timeline.is_empty() {
+                        home::render_home(frame, body_area, &self.home, &detached);
+                    } else {
+                        // Roster on top, recent dispatch activity below
+                        // (ADR-0013 timeline panel).
+                        let rows = (self.timeline.len() as u16 + 2).min(10);
+                        let split =
+                            Layout::vertical([Constraint::Min(5), Constraint::Length(rows)])
+                                .split(body_area);
+                        home::render_home(frame, split[0], &self.home, &detached);
+                        dispatch::render_timeline(frame, split[1], &self.timeline);
+                    }
                 }
             }
         }
@@ -1286,6 +1599,9 @@ impl App {
         }
         if let Some(pal) = &self.palette {
             self.draw_palette(frame, area, pal);
+        }
+        if let Some(form) = &self.dispatch_form {
+            dispatch::render_form(frame, area, form);
         }
         if let Some(action) = self.pending_confirm {
             self.draw_confirm(frame, area, action);
@@ -1732,6 +2048,94 @@ mod tests {
         assert_eq!(app.default_picker_selection(), 1);
     }
 
+    #[test]
+    fn drive_dispatches_folds_events_into_registry_and_timeline() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // A headless registry row, exactly as start_dispatch would create it.
+        let now = SystemTime::now();
+        let record = SessionRecord {
+            id: 0,
+            tool: "claude-code".to_string(),
+            native_id: None,
+            name: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: SessionMode::Headless,
+            status: SessionStatus::Running,
+            created_at: now,
+            updated_at: now,
+            cost_usd: None,
+            model: None,
+            effort: None,
+            role: Some("coder".to_string()),
+        };
+        let sid = app.registry.create(&record).expect("create headless row");
+        let row = app
+            .registry
+            .record_dispatch(sid, "claude-code", "review", std::path::Path::new("/tmp"))
+            .expect("dispatch row");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                done: false,
+                dispatch_row: Some(row),
+            },
+        );
+
+        tx.send(AgentEvent::Started {
+            native_id: Some("native-xyz".to_string()),
+        })
+        .unwrap();
+        tx.send(AgentEvent::AgentText("thinking about it".to_string()))
+            .unwrap();
+        tx.send(AgentEvent::ToolActivity("Read".to_string()))
+            .unwrap();
+        assert!(app.drive_dispatches(), "pending events must mark dirty");
+
+        tx.send(AgentEvent::Completed {
+            result: "done".to_string(),
+            cost_usd: Some(0.02),
+        })
+        .unwrap();
+        drop(tx);
+        assert!(app.drive_dispatches());
+
+        let rec = app
+            .registry
+            .all()
+            .expect("read registry")
+            .into_iter()
+            .find(|r| r.id == sid)
+            .expect("row survives");
+        assert_eq!(rec.native_id.as_deref(), Some("native-xyz"));
+        assert_eq!(rec.status, SessionStatus::Completed);
+        assert_eq!(rec.cost_usd, Some(0.02));
+        let history = app.registry.dispatch_history(5).expect("history");
+        assert!(history[0].finished);
+        assert_eq!(history[0].outcome.as_deref(), Some("completed"));
+        assert!(app.dispatches[&sid].done);
+        assert!(app.timeline.iter().any(|l| l.contains("completed")));
+        // A finished dispatch is inert: nothing new to fold.
+        assert!(!app.drive_dispatches());
+    }
+
+    #[test]
+    fn open_dispatch_form_requires_an_installed_tool() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // Empty probe cache → every target greyed → the form refuses to open.
+        app.open_dispatch_form();
+        assert!(app.dispatch_form.is_none());
+        assert!(app.timeline.iter().any(|l| l.contains("no installed tool")));
+
+        app.probe_cache.insert(
+            AdapterKind::ClaudeCode,
+            Ok(crate::adapters::claude_code::EXPECTED_CAPS),
+        );
+        app.open_dispatch_form();
+        assert!(app.dispatch_form.is_some());
+    }
+
     // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
 
     fn test_record(id: u64, tool: &str) -> SessionRecord {
@@ -1794,6 +2198,9 @@ mod tests {
             usage: HashMap::new(),
             probes: HashMap::new(),
             pane_area_size: PaneSize { rows: 24, cols: 80 },
+            dispatches: HashMap::new(),
+            dispatch_form: None,
+            timeline: std::collections::VecDeque::new(),
         };
         (app, tmp)
     }
