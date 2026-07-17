@@ -838,6 +838,24 @@ mod tests {
     // -- the two-layer merge (ADR-0012) -------------------------------------
 
     #[test]
+    fn shared_only_layer_loads_through_the_two_layer_path() {
+        // The composed `load` with the overlay file absent — the everyday
+        // case for a repo with no personal layer (verifier gap, 2026-07-17).
+        let plan = load_pair(
+            Some(
+                r#"{ "version": 2,
+                    "roles": { "coder": { "tool": "claude-code" } },
+                    "defaults": { "default_role": "coder" } }"#,
+            ),
+            None,
+        )
+        .expect("no error")
+        .expect("plan present");
+        assert_eq!(plan.roles.len(), 1);
+        assert_eq!(plan.defaults.default_role.as_deref(), Some("coder"));
+    }
+
+    #[test]
     fn local_only_layer_loads() {
         let plan = load_pair(
             None,
