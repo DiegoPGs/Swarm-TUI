@@ -125,21 +125,36 @@ impl Registry {
         Ok(Registry { conn })
     }
 
-    /// Hand back a fresh, unused session id.
-    ///
-    /// `upsert` can't allocate one for us because `SessionRecord.id: u64` is
-    /// not `Option` — callers need an id *before* they can construct the
-    /// record they're about to persist. `MAX(id) + 1` is fine for a local,
-    /// single-writer app; there's no concurrent-writer race worth guarding
-    /// against here.
-    pub fn allocate_id(&self) -> Result<u64, StoreError> {
-        let next: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM sessions", [], |row| {
-                row.get(0)
-            })
+    /// Insert a brand-new session row and return its id. `record.id` is
+    /// ignored: SQLite assigns the id inside the INSERT, under its own write
+    /// lock, so two processes sharing one registry file can never allocate
+    /// the same id and clobber each other's rows (the previous
+    /// `SELECT MAX(id)+1` → `INSERT ON CONFLICT DO UPDATE` pair could).
+    /// Status updates to an existing row still go through `upsert`.
+    pub fn create(&mut self, record: &SessionRecord) -> Result<u64, StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO sessions
+                    (tool, native_id, name, cwd, mode, status, created_at, updated_at,
+                     cost_usd, model, effort, role)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    record.tool,
+                    record.native_id,
+                    record.name,
+                    record.cwd.to_string_lossy(),
+                    mode_to_str(record.mode),
+                    status_to_str(record.status),
+                    system_time_to_unix(record.created_at),
+                    system_time_to_unix(record.updated_at),
+                    record.cost_usd,
+                    record.model,
+                    record.effort,
+                    record.role,
+                ],
+            )
             .map_err(|e| StoreError::Query(e.to_string()))?;
-        Ok(next as u64)
+        Ok(self.conn.last_insert_rowid() as u64)
     }
 
     pub fn upsert(&mut self, record: &SessionRecord) -> Result<(), StoreError> {
@@ -264,12 +279,20 @@ impl Registry {
     }
 }
 
+/// A pre-epoch clock clamps to the epoch instead of panicking the write.
 fn system_time_to_unix(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The stored value crosses a real boundary (any process/tool can have
+/// written the database file): a negative or overflowing value clamps to
+/// the epoch instead of panicking the roster read.
 fn unix_to_system_time(v: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(v as u64)
+    u64::try_from(v)
+        .ok()
+        .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+        .unwrap_or(UNIX_EPOCH)
 }
 
 fn mode_to_str(mode: SessionMode) -> &'static str {
@@ -477,10 +500,9 @@ INSERT INTO schema_version (version) VALUES (2);
 
         {
             let mut registry = Registry::open(&db_path).expect("open should migrate");
-            let id = registry.allocate_id().expect("allocate_id");
             registry
-                .upsert(&sample_record(id))
-                .expect("upsert with role should succeed post-migration");
+                .create(&sample_record(0))
+                .expect("create with role should succeed post-migration");
         }
 
         // Second open: version is already 3 — must be a no-op, not a re-run.
@@ -501,10 +523,9 @@ INSERT INTO schema_version (version) VALUES (2);
 
         {
             let mut registry = Registry::open(&db_path).expect("open should migrate");
-            let id = registry.allocate_id().expect("allocate_id");
             registry
-                .upsert(&sample_record(id))
-                .expect("upsert with model/effort should succeed post-migration");
+                .create(&sample_record(0))
+                .expect("create with model/effort should succeed post-migration");
         }
 
         // Second open: version is already current — must be a no-op.
@@ -566,7 +587,9 @@ INSERT INTO schema_version (version) VALUES (2);
         let db_path = tmp.path().join("registry.db");
         let mut registry = Registry::open(&db_path).expect("open should succeed");
 
-        let id = registry.allocate_id().expect("allocate_id should succeed");
+        let id = registry
+            .create(&sample_record(0))
+            .expect("create should succeed");
         assert_eq!(id, 1);
         let record = sample_record(id);
         registry.upsert(&record).expect("upsert should succeed");
@@ -595,11 +618,10 @@ INSERT INTO schema_version (version) VALUES (2);
         let db_path = tmp.path().join("registry.db");
         let mut registry = Registry::open(&db_path).expect("open should succeed");
 
-        let id = registry.allocate_id().expect("allocate_id should succeed");
+        let id = registry
+            .create(&sample_record(0))
+            .expect("create should succeed");
         let mut record = sample_record(id);
-        registry
-            .upsert(&record)
-            .expect("first upsert should succeed");
 
         record.status = SessionStatus::Completed;
         record.updated_at = UNIX_EPOCH + Duration::from_secs(9_999);
@@ -622,14 +644,89 @@ INSERT INTO schema_version (version) VALUES (2);
 
         {
             let mut registry = Registry::open(&db_path).expect("open should succeed");
-            let id = registry.allocate_id().expect("allocate_id should succeed");
-            let record = sample_record(id);
-            registry.upsert(&record).expect("upsert should succeed");
+            registry
+                .create(&sample_record(0))
+                .expect("create should succeed");
         }
 
         let registry_2 = Registry::open(&db_path).expect("reopen should succeed");
         let all = registry_2.all().expect("all() should succeed");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].tool, "claude-code");
+    }
+
+    /// F-001: two Registry handles on the same file (as two concurrent
+    /// swarm-tui processes would hold) each create a fresh session — the
+    /// result must be two distinct rows, never one overwriting the other.
+    #[test]
+    fn two_handles_creating_fresh_sessions_never_clobber() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("registry.db");
+        let mut handle_a = Registry::open(&db_path).expect("open handle a");
+        let mut handle_b = Registry::open(&db_path).expect("open handle b");
+
+        let mut record_a = sample_record(0);
+        record_a.name = Some("from process a".to_string());
+        let mut record_b = sample_record(0);
+        record_b.name = Some("from process b".to_string());
+
+        let id_a = handle_a.create(&record_a).expect("create via handle a");
+        let id_b = handle_b.create(&record_b).expect("create via handle b");
+        assert_ne!(id_a, id_b, "fresh sessions must get distinct ids");
+
+        let all = handle_a.all().expect("all()");
+        assert_eq!(all.len(), 2, "both sessions must survive");
+        let names: Vec<_> = all.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert!(names.contains(&"from process a"));
+        assert!(names.contains(&"from process b"));
+    }
+
+    /// F-004: a pre-epoch clock on the write side clamps to the epoch
+    /// instead of panicking.
+    #[test]
+    fn pre_epoch_system_time_clamps_to_epoch_on_write() {
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(100);
+        assert_eq!(system_time_to_unix(pre_epoch), 0);
+    }
+
+    /// F-004: negative/overflowing values stored in the database file (a
+    /// real boundary — any process can have written it) clamp instead of
+    /// panicking.
+    #[test]
+    fn out_of_range_stored_timestamp_clamps_instead_of_panicking() {
+        assert_eq!(unix_to_system_time(-1), UNIX_EPOCH);
+        assert_eq!(unix_to_system_time(i64::MIN), UNIX_EPOCH);
+        // i64::MAX seconds overflows SystemTime on common platforms; the
+        // exact clamped value doesn't matter, not panicking does.
+        let _ = unix_to_system_time(i64::MAX);
+    }
+
+    /// F-004 end to end: a row with negative timestamps already persisted
+    /// in the file must not panic the roster read.
+    #[test]
+    fn negative_stored_timestamps_read_back_clamped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("registry.db");
+        {
+            let _ = Registry::open(&db_path).expect("create schema");
+        }
+        {
+            let conn = Connection::open(&db_path).expect("raw open");
+            conn.execute(
+                "INSERT INTO sessions
+                    (id, tool, cwd, mode, status, created_at, updated_at)
+                 VALUES (1, 'claude-code', '/x', 'interactive', 'running', -5, -5)",
+                [],
+            )
+            .expect("insert row with negative timestamps");
+        }
+
+        let registry = Registry::open(&db_path).expect("reopen");
+        let all = registry
+            .all()
+            .expect("all() must not panic on negative stored timestamps");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].created_at, UNIX_EPOCH);
+        assert_eq!(all[0].updated_at, UNIX_EPOCH);
     }
 }

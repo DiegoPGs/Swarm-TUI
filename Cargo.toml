@@ -5,7 +5,9 @@ edition = "2021"
 description = "One terminal above Claude Code, Antigravity CLI, and Codex CLI: session tabs per tool, a home view for cross-agent dispatch."
 license = "MIT"
 repository = "https://github.com/DiegoPGs/Swarm-TUI"
-rust-version = "1.75"
+# True floor verified 2026-07-17: `cargo check` fails on 1.94.1 (libsqlite3-sys
+# 0.38.1 uses `cfg_select!`, unstable there) and succeeds on 1.95.0.
+rust-version = "1.95"
 
 # Versions verified live on crates.io on 2026-07-04 and enabled on 2026-07-05
 # (first implementation session — see docs/NOTES.md).

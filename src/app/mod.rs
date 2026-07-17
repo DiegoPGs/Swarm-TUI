@@ -550,10 +550,10 @@ impl App {
         let cmd = kind.interactive_cmd(&intent, &opts, &cwd);
         let pane_id = self.pane_host.spawn(cmd, self.pane_area_size)?;
 
-        let id = self.registry.allocate_id()?;
         let now = SystemTime::now();
-        let record = SessionRecord {
-            id,
+        let mut record = SessionRecord {
+            // Placeholder — the registry assigns the real id on create().
+            id: 0,
             tool: kind.id().to_string(),
             native_id: if kind == AdapterKind::ClaudeCode {
                 Some(hint.clone())
@@ -571,7 +571,7 @@ impl App {
             effort: opts.effort,
             role: role.as_ref().map(|r| r.name.clone()),
         };
-        self.registry.upsert(&record)?;
+        record.id = self.registry.create(&record)?;
         self.pane_of_session.insert(record.id, pane_id);
         self.tabs.promote(record.id);
         if let Some(role) = role {
@@ -626,11 +626,28 @@ impl App {
                 _ => SessionStatus::Failed,
             };
 
-            if let Ok(mut records) = self.registry.all() {
-                if let Some(record) = records.iter_mut().find(|r| r.id == session_id) {
-                    record.status = status;
-                    record.updated_at = SystemTime::now();
-                    let _ = self.registry.upsert(record);
+            // Persist failures stay non-fatal (the tab still closes), but
+            // never silently: a dropped write leaves the row stuck Running.
+            match self.registry.all() {
+                Ok(mut records) => {
+                    if let Some(record) = records.iter_mut().find(|r| r.id == session_id) {
+                        record.status = status;
+                        record.updated_at = SystemTime::now();
+                        if let Err(e) = self.registry.upsert(record) {
+                            tracing::warn!(
+                                session_id,
+                                error = ?e,
+                                "failed to persist close status; registry row left as-is"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id,
+                        error = ?e,
+                        "failed to read registry while closing session; status not persisted"
+                    );
                 }
             }
             self.pane_of_session.remove(&session_id);
@@ -1795,6 +1812,91 @@ mod tests {
             seen.contains("/status"),
             "injected command never reached the pane; screen:\n{seen}"
         );
+    }
+
+    // -- close-path persistence failures (F-002) ------------------------------
+
+    /// Collects everything the tracing subscriber writes, so tests can
+    /// assert the close path warns instead of failing silently.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn capture_warnings() -> (CaptureWriter, tracing::subscriber::DefaultGuard) {
+        let writer = CaptureWriter::default();
+        let sink = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
+
+    #[tokio::test]
+    async fn close_warns_when_the_status_write_fails() {
+        let (mut app, tmp) = app_with_cat_pane("claude-code");
+        app.registry
+            .create(&test_record(0, "claude-code"))
+            .expect("seed session row");
+        // Simulate a registry that can be read but not written (e.g. the
+        // file went read-only after open): block UPDATEs at the SQL layer.
+        let raw = rusqlite::Connection::open(tmp.path().join("registry.db")).expect("raw open");
+        raw.execute_batch(
+            "CREATE TRIGGER block_updates BEFORE UPDATE ON sessions
+             BEGIN SELECT RAISE(ABORT, 'registry is read-only'); END;",
+        )
+        .expect("install write-blocking trigger");
+
+        app.tabs.promote(1);
+        let (log, _guard) = capture_warnings();
+        app.perform_close_active_tab().await;
+
+        let out = log.contents();
+        assert!(
+            out.contains("failed to persist close status"),
+            "expected a warning about the dropped status write, got:\n{out}"
+        );
+        assert!(
+            out.contains("session_id=1"),
+            "warning names the session:\n{out}"
+        );
+        // Non-fatal: the tab is gone even though the write failed.
+        assert_eq!(app.tabs.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_warns_when_the_registry_read_fails() {
+        let (mut app, tmp) = app_with_cat_pane("claude-code");
+        let raw = rusqlite::Connection::open(tmp.path().join("registry.db")).expect("raw open");
+        raw.execute_batch("DROP TABLE sessions;")
+            .expect("break the registry read");
+
+        app.tabs.promote(1);
+        let (log, _guard) = capture_warnings();
+        app.perform_close_active_tab().await;
+
+        let out = log.contents();
+        assert!(
+            out.contains("failed to read registry while closing session"),
+            "expected a warning about the failed roster read, got:\n{out}"
+        );
+        assert_eq!(app.tabs.items.len(), 1);
     }
 
     // -- roles wiring (ADR-0010; fake panes only — no wrapped CLI) -----------
