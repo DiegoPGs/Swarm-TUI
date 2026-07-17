@@ -103,7 +103,7 @@ impl CliAdapter for Codex {
     fn dispatch(&self, _task: &Task) -> Result<DispatchHandle, AdapterError> {
         // TODO(next session):
         //   codex exec --json <prompt>          (in task.cwd)
-        //   + `--sandbox workspace-write` only when task.budget.allow_writes;
+        //   + `--sandbox workspace-write` only when task.budget.posture is Edits;
         //   default stays the tool's read-only sandbox.
         // PRECONDITION (router-enforced): task.cwd is inside a git repo —
         // codex exec refuses otherwise; surface that as a friendly dispatch

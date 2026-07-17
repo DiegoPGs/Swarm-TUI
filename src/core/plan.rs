@@ -105,19 +105,10 @@ pub struct DispatchPrefs {
     pub timeout_secs: Option<u64>,
 }
 
-/// Neutral posture axis; each adapter maps it to its own mechanism at
-/// dispatch time. Deliberately has no "bypass"/"skip permissions" value —
-/// the ARCHITECTURE table's "never by default" row is unrepresentable here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DispatchPosture {
-    /// Read/analyze only.
-    ReadOnly,
-    /// Plan first; no edits without escalation.
-    Plan,
-    /// Edits allowed within the adapter's conservative build-task envelope.
-    Edits,
-}
+/// The neutral posture axis lives in `core::task` since ADR-0013 (dispatch
+/// is its consumer); re-exported so the plan schema (ADR-0012) keeps its
+/// public path and deserializes it unchanged.
+pub use crate::core::task::DispatchPosture;
 
 /// Where dispatched work runs. `per_task` is a reserved schema slot
 /// (PRODUCT.md question 4) — this build rejects it rather than silently
