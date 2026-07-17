@@ -194,8 +194,11 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
 
     // 2. Prefix + c opens the new-session picker. The harness cwd is the
     // repo root, so the committed `.swarm/swarm.json` lists THREE roles
-    // above the tools (ADR-0010) — selecting a role would inject startup
-    // commands into a real CLI, so navigate past them: 3×`j` lands on the
+    // above the tools (ADR-0010) and its `defaults.default_role: "coder"`
+    // preselects index 1 (ADR-0012; rows are alphabetical: advisor, coder,
+    // researcher — this harness assumes no `.swarm/swarm.local.json` overlay
+    // shifts the plan). Selecting a role would inject startup commands into
+    // a real CLI, so navigate past them: 2×`j` from "coder" lands on the
     // Claude Code *tool* row, whose Enter opens the options form — a second
     // Enter with everything empty launches with tool defaults. All Enters
     // land on swarm-tui's own surfaces, not a pane.
@@ -204,7 +207,7 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     d.send(b"c")?;
     d.wait_for("picker opens", "New session", Duration::from_secs(5))?;
     d.wait_for("roles section renders", "Roles —", Duration::from_secs(5))?;
-    d.send(b"jjj")?;
+    d.send(b"jj")?;
     thread::sleep(Duration::from_millis(150));
     d.send(b"\r")?;
     d.wait_for("options form opens", "Model:", Duration::from_secs(5))?;
@@ -274,17 +277,17 @@ fn smoke(bin: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     d.wait_for("home after close", "Failed", Duration::from_secs(10))?;
     d.snapshot("7-home-after-close");
 
-    // 8. Second tool: picker → 4×down (past the three roles and Claude
-    // Code) → Enter selects the agy tool row, whose options form (model
-    // only) opens; Enter with an empty model launches defaults. While the
-    // repo dir is untrusted, agy boots to its workspace-trust dialog; after
-    // the owner trusts it (milestone 2b stage 2), the main UI boots instead
-    // — both paint a Gemini model name, so wait on that and report which
-    // state.
+    // 8. Second tool: picker (preselected on "coder" again) → 3×down (past
+    // the remaining role and Claude Code) → Enter selects the agy tool row,
+    // whose options form (model only) opens; Enter with an empty model
+    // launches defaults. While the repo dir is untrusted, agy boots to its
+    // workspace-trust dialog; after the owner trusts it (milestone 2b stage
+    // 2), the main UI boots instead — both paint a Gemini model name, so
+    // wait on that and report which state.
     d.send(PREFIX)?;
     d.send(b"c")?;
     d.wait_for("picker opens again", "New session", Duration::from_secs(5))?;
-    d.send(b"jjjj")?;
+    d.send(b"jjj")?;
     thread::sleep(Duration::from_millis(150));
     d.send(b"\r")?;
     d.wait_for("agy options form", "Model:", Duration::from_secs(5))?;
