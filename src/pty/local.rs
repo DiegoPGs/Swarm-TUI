@@ -16,6 +16,16 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::{PaneError, PaneHost, PaneId, PaneSize};
 
+/// Lock a pane mutex, recovering from poison. A poisoned mutex means a
+/// thread panicked while holding it (e.g. the pane's reader thread inside
+/// vt100 `process()`); the guarded data is a terminal grid or child handle
+/// that stays safe to use, and propagating the panic would cascade one
+/// pane's failure into every later lock site — aborting the whole UI
+/// instead of degrading that pane.
+fn lock_ignore_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Pane {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -118,7 +128,7 @@ impl PaneHost for LocalPaneHost {
             loop {
                 match reader.read(&mut buf) {
                     Ok(n) if n > 0 => {
-                        reader_parser.lock().unwrap().process(&buf[..n]);
+                        lock_ignore_poison(&reader_parser).process(&buf[..n]);
                         let _ = reader_changed_tx.send(pane_id);
                     }
                     _ => {
@@ -131,7 +141,7 @@ impl PaneHost for LocalPaneHost {
                         // stays conservatively "failed", same as before.
                         let mut success = None;
                         for _ in 0..100 {
-                            match reader_child.lock().unwrap().try_wait() {
+                            match lock_ignore_poison(&reader_child).try_wait() {
                                 Ok(Some(status)) => {
                                     success = Some(status.success());
                                     break;
@@ -141,7 +151,7 @@ impl PaneHost for LocalPaneHost {
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                        *reader_exit_success.lock().unwrap() = Some(success.unwrap_or(false));
+                        *lock_ignore_poison(&reader_exit_success) = Some(success.unwrap_or(false));
                         let _ = reader_changed_tx.send(pane_id);
                         break;
                     }
@@ -187,9 +197,7 @@ impl PaneHost for LocalPaneHost {
                 pixel_height: 0,
             })
             .map_err(|e| PaneError::Spawn(std::io::Error::other(e)))?;
-        pane.parser
-            .lock()
-            .unwrap()
+        lock_ignore_poison(&pane.parser)
             .screen_mut()
             .set_size(size.rows, size.cols);
         Ok(())
@@ -211,7 +219,7 @@ impl PaneHost for LocalPaneHost {
             .get(&pane)
             .ok_or(PaneError::UnknownPane(pane))
             .map(|p| {
-                let guard = p.parser.lock().unwrap();
+                let guard = lock_ignore_poison(&p.parser);
                 f(guard.screen())
             })
     }
@@ -221,9 +229,7 @@ impl PaneHost for LocalPaneHost {
             .panes
             .get_mut(&pane)
             .ok_or(PaneError::UnknownPane(pane))?;
-        pane.child
-            .lock()
-            .unwrap()
+        lock_ignore_poison(&pane.child)
             .kill()
             .map_err(PaneError::Spawn)?;
         Ok(())
@@ -232,7 +238,7 @@ impl PaneHost for LocalPaneHost {
     fn exit_success(&self, pane: PaneId) -> Option<bool> {
         self.panes
             .get(&pane)
-            .and_then(|p| *p.exit_success.lock().unwrap())
+            .and_then(|p| *lock_ignore_poison(&p.exit_success))
     }
 }
 
@@ -362,6 +368,49 @@ mod tests {
             Duration::from_secs(2)
         ));
         assert_eq!(host.exit_success(fail_pane), Some(false));
+    }
+
+    /// F-003: a panic while holding one pane's parser lock (the way a
+    /// reader-thread panic inside vt100 `process()` would poison it) must
+    /// degrade that pane only — never cascade into panics on other panes'
+    /// lock sites.
+    #[test]
+    fn poisoned_pane_lock_degrades_that_pane_only() {
+        let (mut host, _rx) = LocalPaneHost::new();
+        let mut cmd_a = Command::new("sh");
+        cmd_a.arg("-c").arg("sleep 5");
+        let poisoned = host.spawn(cmd_a, PaneSize { rows: 24, cols: 80 }).unwrap();
+        let mut cmd_b = Command::new("sh");
+        cmd_b.arg("-c").arg("sleep 5");
+        let healthy = host.spawn(cmd_b, PaneSize { rows: 24, cols: 80 }).unwrap();
+
+        let parser = Arc::clone(&host.panes.get(&poisoned).unwrap().parser);
+        let panicked = std::thread::spawn(move || {
+            let _guard = parser.lock().unwrap();
+            panic!("simulated reader-thread panic under the parser lock");
+        })
+        .join();
+        assert!(panicked.is_err(), "helper thread must have panicked");
+        assert!(host.panes.get(&poisoned).unwrap().parser.is_poisoned());
+
+        // The other pane keeps working…
+        host.with_screen(healthy, |s| s.contents())
+            .expect("with_screen on the healthy pane");
+        host.resize(
+            healthy,
+            PaneSize {
+                rows: 30,
+                cols: 100,
+            },
+        )
+        .expect("resize on the healthy pane");
+
+        // …and even the poisoned pane recovers instead of panicking.
+        host.with_screen(poisoned, |s| s.contents())
+            .expect("with_screen on the poisoned pane");
+
+        host.kill(poisoned).unwrap();
+        host.kill(healthy).unwrap();
     }
 
     #[test]
