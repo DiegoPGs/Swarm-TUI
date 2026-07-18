@@ -19,19 +19,25 @@ workspace:
 
 ## Status
 
-**Milestone 2c (the swarm plan) is implemented as of 2026-07-16**, on top of the
-2b command plane (same day) and the 2a shell (2026-07-15). `cargo run` boots a
-real, interactive terminal shell — tabs, a home roster, and live PTY sessions for
-Claude Code and Antigravity CLI (an active tool degrades to a greyed-out badge if
-its probe fails, never disappears), plus Claude Code background-agent
-reconciliation, a **command palette** (`Ctrl-Space` then `:`), and **launch
-options** (model/effort on spawn, stored on the session row). New in 2c: a
-committed **`.swarm/swarm.json` roles file** — named launch presets the
-new-session picker lists above the raw tools, with startup commands injected
-after first paint ([ADR-0010](docs/adr/0010-swarm-plan-roles-file.md)) — and a
-**Resources view** (`Ctrl-Space` then `u`) showing each vendor's own usage screen,
-captured verbatim from a hidden probe pane on manual refresh
-([ADR-0011](docs/adr/0011-usage-view-probe-pane.md)). Per-tool command and usage
+**Milestone 2d (workspace personalization) is implemented as of 2026-07-17**,
+on top of the 2c swarm plan (2026-07-16), the 2b command plane (same day), and
+the 2a shell (2026-07-15). `cargo run` boots a real, interactive terminal
+shell — tabs, a home roster, and live PTY sessions for Claude Code and
+Antigravity CLI (an active tool degrades to a greyed-out badge if its probe
+fails, never disappears), plus Claude Code background-agent reconciliation, a
+**command palette** (`Ctrl-Space` then `:`), and **launch options**
+(model/effort on spawn, stored on the session row). From 2c: a committed
+**`.swarm/swarm.json` roles file** — named launch presets the new-session
+picker lists above the raw tools, with startup commands injected after first
+paint ([ADR-0010](docs/adr/0010-swarm-plan-roles-file.md)) — and a
+**Resources view** (`Ctrl-Space` then `u`) showing each vendor's own usage
+screen, captured verbatim from a hidden probe pane on manual refresh
+([ADR-0011](docs/adr/0011-usage-view-probe-pane.md)). New in 2d: **schema v2
+`defaults`** (picker preselect, broadcast set, dispatch guardrail
+preferences, worktree policy slot) and a **personal, gitignored
+`.swarm/swarm.local.json` overlay** that adds or overrides roles and defaults
+per machine
+([ADR-0012](docs/adr/0012-workspace-personalization-two-layer-plan.md)). Per-tool command and usage
 facts live in
 [`docs/integrations/command-surfaces.md`](docs/integrations/command-surfaces.md). **Codex CLI is suspended as of 2026-07-16**
 ([ADR-0008](docs/adr/0008-suspend-codex-integration.md)): its adapter stays
@@ -59,14 +65,15 @@ session tab — the picker lists your workspace's **roles** first, then the raw
 tools (uninstalled tools are greyed out, not hidden). See the keymap below for
 everything else.
 
-### Roles (`.swarm/swarm.json`)
+### Roles & defaults (`.swarm/swarm.json` + `.swarm/swarm.local.json`)
 
-Commit a roles file at the repo root and the picker turns it into one-keystroke
-launch presets. This repo dogfoods its own:
+Commit a plan file at the repo root and the picker turns it into one-keystroke
+launch presets. Schema v2 adds an optional `defaults` object; this repo
+dogfoods its own:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "roles": {
     "researcher": { "tool": "antigravity", "model": "gemini-3.1-pro",
                     "purpose": "web search & docs" },
@@ -75,6 +82,12 @@ launch presets. This repo dogfoods its own:
     "advisor":    { "tool": "claude-code", "model": "sonnet-5",
                     "purpose": "general advisor",
                     "startup_commands": ["/advisor fable"] }
+  },
+  "defaults": {
+    "default_role": "coder",
+    "broadcast": ["coder", "advisor"],
+    "dispatch": { "posture": "plan" },
+    "worktrees": "in_place"
   }
 }
 ```
@@ -82,9 +95,23 @@ launch presets. This repo dogfoods its own:
 Model strings pass **verbatim** to the tool's `--model` (an invalid id is the
 tool's own in-pane error); `startup_commands` inject in order once the pane
 paints, and any command whose effect persists beyond the session asks for a y/n
-first. Missing file = no roles section; malformed file = a one-line error in the
-picker. Never put secrets in this file — no field accepts them. Details in
-[ADR-0010](docs/adr/0010-swarm-plan-roles-file.md).
+first. `defaults` are preferences, not policy: `default_role` preselects a
+picker row; `broadcast` names the roles a broadcast targets by default (naming
+a role is the explicit opt-in for its tool — the quota-shared agy is out unless
+named); `dispatch` tightens the headless-dispatch guardrails in neutral terms
+(`posture`, `max_turns`, `max_budget_usd`, `timeout_secs` — broadcast and
+dispatch behavior land in milestone 3); `worktrees` accepts `in_place` for now
+(`per_task` is reserved).
+
+A personal, gitignored **`.swarm/swarm.local.json`** overlays the committed
+file: same schema, merged per named entry (role names, defaults fields) with
+local winning wholesale per entry — add your own roles, pick your own
+`default_role`, keep the team's guardrails. Missing file = that layer simply
+absent; a malformed layer = a one-line picker error naming the offending file.
+Both reload with `Ctrl-Space` `r`. Never put secrets in these files — no field
+accepts them. Details in
+[ADR-0010](docs/adr/0010-swarm-plan-roles-file.md) and
+[ADR-0012](docs/adr/0012-workspace-personalization-two-layer-plan.md).
 
 ## Keymap
 
@@ -99,7 +126,7 @@ Press **Ctrl-Space** to enter the one-shot command mode, then press one of:
 | `:` | Command palette — inject a native slash command into the active session tab |
 | `d` | Detach |
 | `x` | Close tab (confirm) |
-| `r` | Refresh roster + reload `.swarm/swarm.json` |
+| `r` | Refresh roster + reload `.swarm/swarm.json` and its `.local` overlay |
 | `u` | Resources view — per-vendor usage (digit refreshes a vendor; Esc/`u` back) |
 | `?` | Keymap overlay |
 | `q` | Quit (confirm if any pane is alive; quitting kills remaining panes after confirmation) |

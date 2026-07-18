@@ -49,8 +49,15 @@ driving any CLI's internal subagent system (ADR-0004); transcript browsing/repla
 4. **Worktree isolation.** Should home-view dispatch default to a fresh git worktree
    per task (Claude has `-w` native; Codex/agy would need swarm-tui to create it), or
    run in-place? In-place assumed for v1; worktrees are the obvious v2 safety upgrade.
+   *Partially decided 2026-07-17 (ADR-0012): the plan schema reserves a
+   `defaults.worktrees` slot (`in_place` accepted, `per_task` rejected as
+   reserved); the behavior question itself stays open until dispatch lands.*
 5. **agy under quota.** Given shared-quota burn (see integration page), should
    broadcast exclude agy by default and require opting it in per task?
+   *Decided 2026-07-17 (ADR-0012): yes — nothing is broadcast-targeted unless
+   named; an agy-backed role joins only when the workspace names it in
+   `defaults.broadcast` or the user opts it in per task. Enforcement lands
+   with broadcast (milestone 3).*
 6. **Windows.** Design keeps the door open (ConPTY via portable-pty); is it worth any
    testing time at all, or is Linux+macOS the whole world for this tool?
 7. **Approval surfacing (v2).** Claude's `--permission-prompt-tool` could route

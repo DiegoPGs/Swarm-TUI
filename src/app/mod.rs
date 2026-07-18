@@ -276,9 +276,11 @@ fn role_startup_commands(kind: AdapterKind, role: &Role) -> Vec<StartupCommand> 
         .collect()
 }
 
-/// Load `.swarm/swarm.json` from the launch cwd (ADR-0010). Both slug lists
-/// come from `adapters` so no tool name is ever spelled here; errors come
-/// back as the one-line string the picker renders.
+/// Load the swarm plan from the launch cwd — `.swarm/swarm.json` plus the
+/// personal `.swarm/swarm.local.json` overlay (ADR-0010, ADR-0012; the merge
+/// lives in `core/plan.rs`). Both slug lists come from `adapters` so no tool
+/// name is ever spelled here; errors come back as the one-line string the
+/// picker renders.
 fn load_swarm_plan() -> (Option<SwarmPlan>, Option<String>) {
     let dir = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -815,7 +817,9 @@ impl App {
             KeyCode::Char('n') => self.tabs.next(),
             KeyCode::Char('p') => self.tabs.prev(),
             KeyCode::Char('c') => {
-                self.new_session_picker = Some(PickerState::ChooseTool { selected: 0 });
+                self.new_session_picker = Some(PickerState::ChooseTool {
+                    selected: self.default_picker_selection(),
+                });
             }
             KeyCode::Char(':') => self.open_palette(),
             KeyCode::Char('d') => self.detach_active_tab(),
@@ -1047,6 +1051,23 @@ impl App {
             changed = true;
         }
         changed
+    }
+
+    /// Initial picker cursor: the plan's `defaults.default_role` row when one
+    /// is set (ADR-0012), else the top. The name is validated against the
+    /// merged roles at load time, so the position lookup only misses if the
+    /// role's tool failed `from_slug` — degrade to the top, never panic.
+    fn default_picker_selection(&self) -> usize {
+        let Some(plan) = self.plan.as_ref() else {
+            return 0;
+        };
+        let Some(want) = plan.defaults.default_role.as_deref() else {
+            return 0;
+        };
+        picker_items(Some(plan))
+            .iter()
+            .position(|item| matches!(item, PickerItem::Role { name, .. } if name == want))
+            .unwrap_or(0)
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) {
@@ -1604,6 +1625,7 @@ pub async fn run(config: SwarmTuiConfig) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::adapters::LaunchOptionsDecl;
+    use crate::core::plan::Defaults;
 
     #[test]
     fn build_launch_options_maps_empty_fields_to_none() {
@@ -1641,7 +1663,10 @@ mod tests {
         roles.insert("researcher".to_string(), mk("antigravity"));
         roles.insert("advisor".to_string(), mk("claude-code"));
         roles.insert("coder".to_string(), mk("claude-code"));
-        let plan = SwarmPlan { roles };
+        let plan = SwarmPlan {
+            roles,
+            defaults: Defaults::default(),
+        };
 
         let names: Vec<String> = picker_items(Some(&plan))
             .iter()
@@ -1668,6 +1693,43 @@ mod tests {
             items[0],
             PickerItem::Tool(AdapterKind::ClaudeCode)
         ));
+    }
+
+    #[test]
+    fn picker_preselects_the_default_role_row() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        let mk = |tool: &str| Role {
+            tool: tool.to_string(),
+            model: None,
+            effort: None,
+            purpose: None,
+            startup_commands: vec![],
+        };
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert("advisor".to_string(), mk("claude-code"));
+        roles.insert("coder".to_string(), mk("claude-code"));
+        roles.insert("researcher".to_string(), mk("antigravity"));
+
+        // No plan → the cursor starts at the top.
+        assert_eq!(app.default_picker_selection(), 0);
+
+        // A plan without a default_role → still the top.
+        app.plan = Some(SwarmPlan {
+            roles: roles.clone(),
+            defaults: Defaults::default(),
+        });
+        assert_eq!(app.default_picker_selection(), 0);
+
+        // default_role → that role's row (alphabetical: advisor, coder,
+        // researcher — so "coder" is index 1).
+        app.plan = Some(SwarmPlan {
+            roles,
+            defaults: Defaults {
+                default_role: Some("coder".to_string()),
+                ..Defaults::default()
+            },
+        });
+        assert_eq!(app.default_picker_selection(), 1);
     }
 
     // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
@@ -1938,7 +2000,10 @@ mod tests {
                 startup_commands: vec!["/advisor fable".to_string()],
             },
         );
-        app.plan = Some(SwarmPlan { roles });
+        app.plan = Some(SwarmPlan {
+            roles,
+            defaults: Defaults::default(),
+        });
         app.new_session_picker = Some(PickerState::ChooseTool { selected: 0 });
 
         app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

@@ -458,3 +458,43 @@ enabled; plus everything still open from 2b (agy `--model` argument format —
 relevant to the dogfood `researcher` role's `gemini-3.1-pro` string — `/model`
 persistence, `/schedule` timer lifetime, claude `/effort max` stickiness, agy
 live-dispatch items, everything codex).
+
+## Milestone 2d complete — workspace personalization (2026-07-17)
+
+**What landed (ADR-0012).** Plan schema v2: v1's roles unchanged plus an
+optional `defaults` object — `default_role` (picker preselect, wired),
+`broadcast` (role-name set; naming a role is the explicit opt-in for its
+tool, resolving PRODUCT.md question 5's agy-exclusion default), `dispatch`
+(neutral posture/limits that only tighten the normative ARCHITECTURE table;
+no bypass value exists in the enum), `worktrees` (`in_place` accepted,
+`per_task` reserved and rejected with a message saying so). Plus the
+personal, gitignored `.swarm/swarm.local.json` overlay: same schema, merged
+per named entry (role names under `roles`, field names under `defaults`),
+local wins wholesale per entry; a broken layer fails the whole load naming
+the offending file — never partial. `broadcast`/`dispatch`/`worktrees` are
+loaded and validated but behavior-inert until milestone 3. No registry
+change. 18 new tests (99 total, was 81); all four gates green on the target
+machine (`cargo check` / `test` / `clippy --all-targets -- -D warnings` /
+`fmt --check`).
+
+**Durable lessons / deviations:**
+
+1. **Preselect vs. position-driven harnesses.** The dogfooded
+   `default_role: "coder"` moves the picker's initial cursor to row 1, which
+   silently broke `examples/shell_smoke.rs`'s absolute `j`-count navigation
+   (it assumed row 0). Counts and comments updated; the harness now also
+   documents that it assumes no `.swarm/swarm.local.json` overlay exists in
+   the repo root at run time — a local overlay on the dev machine would
+   shift both the row count and the preselect. Anything that navigates the
+   picker by position must be re-checked when the committed plan (or its
+   defaults) changes; ADR-0010 recorded the roles half of this, ADR-0012's
+   consequences record the preselect half.
+2. **Error-string pinning shaped the error type.** The v1 role-level error
+   strings are asserted verbatim by tests (and are picker UX), so the
+   two-layer `PlanError` keeps the shared file's messages byte-identical and
+   prefixes only the overlay's (`.swarm/swarm.local.json: role …`). The
+   version message necessarily changed ("this build reads versions 1 and
+   2") — the old text claimed v1 was the only readable version.
+3. `cargo run` in this repo now boots with "coder" preselected in the
+   picker — one Enter fewer before a real claude spawn. Same
+   worth-knowing-before-pressing-Enter caveat as ADR-0010's dogfood roles.

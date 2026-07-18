@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "roles": {
     "researcher": {
       "tool": "antigravity",
@@ -18,5 +18,11 @@
       "purpose": "general advisor",
       "startup_commands": ["/advisor fable"]
     }
+  },
+  "defaults": {
+    "default_role": "coder",
+    "broadcast": ["coder", "advisor"],
+    "dispatch": { "posture": "plan" },
+    "worktrees": "in_place"
   }
 }

@@ -16,6 +16,9 @@
 CLAUDE.local.md
 .claude/settings.local.json
 
+# swarm-tui personal layer (per-machine, not shared — ADR-0012)
+.swarm/*.local.json
+
 # Editors & OS
 .DS_Store
 Thumbs.db
