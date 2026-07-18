@@ -41,6 +41,11 @@ pub struct AdapterCaps {
     /// the installed binary's `--help`, so upstream drift degrades to "field
     /// hidden in the picker", never a broken spawn.
     pub launch: LaunchOptionsDecl,
+    /// At most one headless dispatch of this tool at a time (ADR-0013;
+    /// ADR-0002's serialized agy lane — its `-c`-based follow-up story only
+    /// works if "most recent conversation" is unambiguous). The app enforces
+    /// it; caps-driven so the app never branches on adapter identity.
+    pub serial_dispatch: bool,
 }
 
 /// Per-tool declaration of the launch options `interactive_cmd` can map

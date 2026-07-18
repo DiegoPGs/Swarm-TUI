@@ -21,6 +21,7 @@ use crate::core::task::{Budget, DispatchPosture, Task};
 /// Deliberately lean — it grows per milestone-3 stage as surfaces need more.
 pub struct RunningDispatch {
     pub handle: DispatchHandle,
+    pub kind: AdapterKind,
     /// Terminal event seen (the entry stays for history; the channel is inert).
     pub done: bool,
     /// `dispatches` table row to finalize; `None` if the insert failed.

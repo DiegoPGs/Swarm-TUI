@@ -44,6 +44,7 @@ pub const EXPECTED_CAPS: AdapterCaps = AdapterCaps {
         model: Some(MODEL_SUGGESTIONS),
         effort: Some(EFFORT_LEVELS),
     },
+    serial_dispatch: false,
 };
 
 /// Palette table (ADR-0009): every entry is ✅ *(local 2026-07-16)* in
@@ -281,6 +282,7 @@ impl CliAdapter for ClaudeCode {
             resume,
             background_supervisor,
             launch,
+            serial_dispatch: EXPECTED_CAPS.serial_dispatch,
         })
     }
 

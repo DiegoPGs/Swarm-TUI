@@ -814,7 +814,17 @@ impl App {
         match key.code {
             KeyCode::Esc => {} // drop the form
             KeyCode::Enter => match form.submit() {
-                Ok((target, task)) => self.start_dispatch(target, task),
+                Ok((target, task)) => {
+                    if self.serial_lane_busy(target.kind) {
+                        // ADR-0013 serialized lane (caps-driven, ADR-0002):
+                        // the form stays open with the reason.
+                        form.error =
+                            Some(format!("{}: one headless run at a time", target.kind.id()));
+                        self.dispatch_form = Some(form);
+                    } else {
+                        self.start_dispatch(target, task);
+                    }
+                }
                 Err(msg) => {
                     form.error = Some(msg);
                     self.dispatch_form = Some(form);
@@ -825,6 +835,17 @@ impl App {
                 self.dispatch_form = Some(form);
             }
         }
+    }
+
+    /// Whether `kind` declares `serial_dispatch` (ADR-0013) and already has
+    /// a live headless run — the app enforces the one-lane rule without
+    /// ever naming a tool (caps-driven, ADR-0006).
+    fn serial_lane_busy(&self, kind: AdapterKind) -> bool {
+        let serial = matches!(
+            self.probe_cache.get(&kind),
+            Some(Ok(caps)) if caps.serial_dispatch
+        );
+        serial && self.dispatches.values().any(|d| d.kind == kind && !d.done)
     }
 
     fn push_timeline(&mut self, line: String) {
@@ -887,6 +908,7 @@ impl App {
             session_id,
             dispatch::RunningDispatch {
                 handle,
+                kind: target.kind,
                 done: false,
                 dispatch_row,
             },
@@ -2078,6 +2100,7 @@ mod tests {
             sid,
             dispatch::RunningDispatch {
                 handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
                 done: false,
                 dispatch_row: Some(row),
             },
@@ -2118,6 +2141,42 @@ mod tests {
         assert!(app.timeline.iter().any(|l| l.contains("completed")));
         // A finished dispatch is inert: nothing new to fold.
         assert!(!app.drive_dispatches());
+    }
+
+    #[test]
+    fn serial_dispatch_lane_blocks_a_second_run_of_that_tool_only() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        app.probe_cache.insert(
+            AdapterKind::Antigravity,
+            Ok(crate::adapters::antigravity::EXPECTED_CAPS),
+        );
+        app.probe_cache.insert(
+            AdapterKind::ClaudeCode,
+            Ok(crate::adapters::claude_code::EXPECTED_CAPS),
+        );
+
+        // No running dispatches → both lanes free.
+        assert!(!app.serial_lane_busy(AdapterKind::Antigravity));
+        assert!(!app.serial_lane_busy(AdapterKind::ClaudeCode));
+
+        // One live agy dispatch → the agy lane is busy; claude (which does
+        // not declare serial_dispatch) never is.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            42,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::Antigravity,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        assert!(app.serial_lane_busy(AdapterKind::Antigravity));
+        assert!(!app.serial_lane_busy(AdapterKind::ClaudeCode));
+
+        // A finished run frees the lane.
+        app.dispatches.get_mut(&42).unwrap().done = true;
+        assert!(!app.serial_lane_busy(AdapterKind::Antigravity));
     }
 
     #[test]

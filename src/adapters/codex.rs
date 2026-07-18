@@ -28,6 +28,7 @@ pub const EXPECTED_CAPS: AdapterCaps = AdapterCaps {
     resume: ResumeSupport::ById,
     background_supervisor: false,
     launch: LaunchOptionsDecl::NONE,
+    serial_dispatch: false,
 };
 
 impl CliAdapter for Codex {
@@ -80,6 +81,7 @@ impl CliAdapter for Codex {
             resume,
             background_supervisor: EXPECTED_CAPS.background_supervisor,
             launch: LaunchOptionsDecl::NONE,
+            serial_dispatch: EXPECTED_CAPS.serial_dispatch,
         })
     }
 
