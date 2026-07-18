@@ -553,3 +553,8 @@ existed nowhere but this disk.
 3. The compare surface is presentation state only: it does not survive an
    app restart (rows and `dispatches` history do), and a new broadcast
    replaces it. Recorded as fine per ADR-0013's in-memory scope.
+4. `promote::decide`'s running-dispatch arm does not consult
+   elsewhere-attachments — unreachable today (every dispatch gets a fresh
+   uuid, no follow-up UI, no agy backfill), so the cross-row join guards
+   only the finished-row paths. Re-check that arm when agy backfill or a
+   follow-up surface lands (verifier finding, 2026-07-17).

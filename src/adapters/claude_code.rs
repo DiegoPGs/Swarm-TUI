@@ -828,6 +828,10 @@ mod tests {
         for (intent, expected) in cases {
             let cmd = ClaudeCode.interactive_cmd(&intent, &o, Path::new("/tmp"));
             assert_eq!(argv(&cmd), expected);
+            // `--resume` id lookup is cwd-scoped (AGENTS.md gotcha): every
+            // intent must run in the caller-passed cwd, Resume especially —
+            // it is what the registry→tab bridge spawns.
+            assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp")));
         }
     }
 }

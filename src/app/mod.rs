@@ -1084,7 +1084,10 @@ impl App {
     /// the handle leaves the map FIRST so the tick never polls it again —
     /// the reader thread's post-kill sends drop silently (its receiver is
     /// gone) and it still reaps the child. A run that finished between
-    /// raising the confirm and answering it keeps its real outcome.
+    /// raising the confirm and answering it keeps its real outcome. The
+    /// kill is fire-and-forget: the resume that follows may overlap the
+    /// dying process for a few milliseconds while the reader thread reaps
+    /// (SIGKILL teardown vs. interactive boot time — acceptable).
     fn stop_running_dispatch(&mut self, session_id: SessionId) {
         let Some(disp) = self.dispatches.remove(&session_id) else {
             return;
@@ -1614,12 +1617,16 @@ impl App {
             ConfirmAction::PromoteRunningDispatch { session_id } => {
                 self.stop_running_dispatch(session_id);
                 if let Err(msg) = self.resume_into_tab(session_id) {
-                    // Unlike the finished-row path, this row was Running a
-                    // moment ago and its run is now dead — downgrade it so
-                    // the roster never shows a zombie Running row.
+                    // The row was Running a moment ago and its run is now
+                    // dead — downgrade it so the roster never shows a
+                    // zombie. Guarded: if the run finished while the
+                    // confirm was up, the tick already recorded the real
+                    // outcome and a failed resume must not clobber it.
                     self.push_timeline(format!("✗ #{session_id} resume failed: {msg}"));
                     self.update_session_row(session_id, |record| {
-                        record.status = SessionStatus::Failed;
+                        if record.status == SessionStatus::Running {
+                            record.status = SessionStatus::Failed;
+                        }
                     });
                     let _ = self.refresh_roster();
                 }
@@ -2968,6 +2975,49 @@ mod tests {
             "the dead run's row is downgraded, never left Running"
         );
         assert_eq!(app.pane_of_session.len(), 1, "no new pane spawned");
+    }
+
+    #[tokio::test]
+    async fn promote_confirm_after_the_run_finished_keeps_the_completed_row() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // The run finished (row Completed, dispatch done) while the confirm
+        // modal was up; the resume then fails (unknown tool). The real
+        // outcome must survive the failed bridge.
+        let mut record = test_record(0, "mystery-tool");
+        record.mode = SessionMode::Headless;
+        record.status = SessionStatus::Completed;
+        record.native_id = Some("native-m".to_string());
+        let sid = app.registry.create(&record).expect("create row");
+        record.id = sid;
+        app.home.roster.push(RosterEntry::Registered(record));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: true,
+                dispatch_row: None,
+            },
+        );
+        app.pending_confirm = Some(ConfirmAction::PromoteRunningDispatch { session_id: sid });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+
+        let rec = app
+            .registry
+            .all()
+            .expect("read registry")
+            .into_iter()
+            .find(|r| r.id == sid)
+            .expect("row survives");
+        assert_eq!(
+            rec.status,
+            SessionStatus::Completed,
+            "a finished run's real outcome is never clobbered by a failed resume"
+        );
+        assert!(app.timeline.iter().any(|l| l.contains("resume failed")));
     }
 
     // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
