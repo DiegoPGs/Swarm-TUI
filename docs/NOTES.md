@@ -498,3 +498,63 @@ machine (`cargo check` / `test` / `clippy --all-targets -- -D warnings` /
 3. `cargo run` in this repo now boots with "coder" preselected in the
    picker — one Enter fewer before a real claude spawn. Same
    worth-knowing-before-pressing-Enter caveat as ADR-0010's dogfood roles.
+
+## Milestone 3 complete — the programmatic plane (2026-07-17)
+
+**What landed (ADR-0013).** Headless dispatch end to end: claude via
+`-p --output-format stream-json --verbose --session-id <uuid>` with a
+defensive fixture-tested NDJSON parser, agy via `-p --print-timeout` with
+synthesized events on an app-serialized lane (`AdapterCaps.serial_dispatch`;
+`Edits` posture and `follow_up` refused inside the adapter until the ⬜
+supervised items land); claude `follow_up()` resumes in the **record's** cwd.
+Home-surface UI: `i` dispatch form and `b` broadcast form (multi-select;
+pretick = merged `defaults.broadcast` role names — the PRODUCT Q5 opt-in
+made real; a broadcast refuses to double-book a serialized lane at submit),
+side-by-side compare surface (status, cost, 100-line rolling tail per
+target; Esc dismisses presentation only), dispatch timeline, first real
+writers for the `dispatches` table. Promote hardening: `promote::decide` is
+a pure total function enforcing one live handle per native id (focus instead
+of double-attach), the registry→tab bridge resumes finished headless rows
+via `interactive_cmd(Resume)` in the record's cwd reusing the same registry
+row, and promoting a running dispatch confirms, stops (handle out of the map
+before the kill so late events drop safely), finalizes `"stopped for
+promote"`, then bridges. No trait change beyond ADR-0013's recorded reshape,
+no registry migration (v3 stays), codex untouched on trait defaults.
+57 new tests since 2d (156 total, was 99); all four gates green.
+
+**Repo-corruption recovery (same day, before the final stages).** A host
+crash mid-commit left 11 zero-byte loose objects and an unreadable branch
+tip: the commit object, its 4 trees, AND the 6 staged blobs were all empty
+(git does not fsync loose objects by default). Recovery that worked, in
+order: back up the whole repo including `.git`; delete the zero-byte
+objects; `git update-ref` the branch to the last intact commit (reflogs end
+there — the lost tip appears in no reflog); then `git hash-object -w` each
+still-staged file — **`git add` alone does NOT rewrite the blobs**, the
+index's stat cache says they're current and never checks the object store —
+and commit with the message preserved in `.git/COMMIT_EDITMSG`;
+`git reflog expire --stale-fix --all` clears the entries that referenced
+the deleted tip. Content-addressing makes the rewritten blobs bit-identical
+to the index's recorded hashes, so nothing is lost when the worktree still
+matches. Durable lesson: push milestone branches early — the lost commit
+existed nowhere but this disk.
+
+**Deviations / disclosures:**
+
+1. Live dispatch/broadcast/resume paths are covered by fixtures and `sh`
+   fakes only (repo rule: no wrapped-CLI calls in `cargo test`). The owner
+   smoke checklist: one real `i` dispatch (claude), one real `b` broadcast
+   (claude-only set), Enter-promote of the finished claude row into a tab,
+   and — supervised, when ready — the agy ⬜ items (headless conversation
+   id retrieval, `--conversation` + `-p`, no-TTY permission behavior),
+   which also unlock agy `follow_up`/backfill per ADR-0013's revisit list.
+2. `timeout_secs` still has no claude mechanism (documented in ADR-0013;
+   no swarm-side watchdog) — the form accepts it, claude ignores it, agy
+   maps it to `--print-timeout`.
+3. The compare surface is presentation state only: it does not survive an
+   app restart (rows and `dispatches` history do), and a new broadcast
+   replaces it. Recorded as fine per ADR-0013's in-memory scope.
+4. `promote::decide`'s running-dispatch arm does not consult
+   elsewhere-attachments — unreachable today (every dispatch gets a fresh
+   uuid, no follow-up UI, no agy backfill), so the cross-row join guards
+   only the finished-row paths. Re-check that arm when agy backfill or a
+   follow-up surface lands (verifier finding, 2026-07-17).

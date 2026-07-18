@@ -28,6 +28,7 @@ pub const EXPECTED_CAPS: AdapterCaps = AdapterCaps {
     resume: ResumeSupport::ById,
     background_supervisor: false,
     launch: LaunchOptionsDecl::NONE,
+    serial_dispatch: false,
 };
 
 impl CliAdapter for Codex {
@@ -80,6 +81,7 @@ impl CliAdapter for Codex {
             resume,
             background_supervisor: EXPECTED_CAPS.background_supervisor,
             launch: LaunchOptionsDecl::NONE,
+            serial_dispatch: EXPECTED_CAPS.serial_dispatch,
         })
     }
 
@@ -103,7 +105,7 @@ impl CliAdapter for Codex {
     fn dispatch(&self, _task: &Task) -> Result<DispatchHandle, AdapterError> {
         // TODO(next session):
         //   codex exec --json <prompt>          (in task.cwd)
-        //   + `--sandbox workspace-write` only when task.budget.allow_writes;
+        //   + `--sandbox workspace-write` only when task.budget.posture is Edits;
         //   default stays the tool's read-only sandbox.
         // PRECONDITION (router-enforced): task.cwd is inside a git repo —
         // codex exec refuses otherwise; surface that as a friendly dispatch

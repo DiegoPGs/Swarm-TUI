@@ -78,8 +78,9 @@ milestone 2d grows the plan into per-project personalization:
   reserved). A gitignored `.swarm/swarm.local.json` overlays the committed
   file per named entry (role names, defaults fields), local winning wholesale
   per entry. A broken layer fails the whole load with an error naming the
-  offending file — never a partial merge. Broadcast/dispatch *behavior* is
-  milestone 3; 2d loads, validates, and carries the preferences.
+  offending file — never a partial merge. Since milestone 3 the `broadcast`
+  and `dispatch` preferences are consumed for real: they prefill the
+  dispatch/broadcast forms and preselect broadcast targets.
 - **Resources view** (prefix+`u`, Home tab body): one block per active vendor —
   the plan's role assignments, the vendor's own usage screen captured VERBATIM, a
   best-effort `%` headline, and a relative "as of Xm ago" timestamp. Refresh is
@@ -92,12 +93,11 @@ milestone 2d grows the plan into per-project personalization:
 
 ## Implementation status
 
-As of this milestone (Stages A1–E, 2026-07-15): the registry (`src/store/`), the
+As of the 2a shell (Stages A1–E, 2026-07-15): the registry (`src/store/`), the
 PTY layer (`src/pty/`), the app shell (`src/app/`), and Claude Code reconciliation
 (`src/app/reconcile.rs`) are real and implemented — `cargo run` boots a working
-terminal shell with tabs, a home roster, and live PTY sessions. `CliAdapter::
-dispatch()`/`follow_up()` (headless dispatch), broadcast, pipelines, and MCP
-integration are still not implemented — deferred to a later milestone.
+terminal shell with tabs, a home roster, and live PTY sessions. Pipelines and
+MCP integration remain unimplemented — deferred.
 
 **Codex CLI is suspended as of 2026-07-16 (ADR-0008):** its adapter stays compiled
 (enum variant, module, dispatch arms all intact) but `registry()` no longer lists
@@ -122,8 +122,19 @@ plan schema v2 (`defaults`: picker preselect, broadcast set, dispatch
 guardrail preferences, worktree policy slot) and the personal
 `.swarm/swarm.local.json` overlay with per-entry shallow merge — see the
 defaults bullet above and ADR-0012. Schema-v1 files keep loading unchanged;
-no registry change. The `broadcast` and `dispatch` preferences are loaded and
-validated but consumed only when milestone 3 lands those features.
+no registry change.
+
+**Milestone 3 (the programmatic plane) is implemented as of 2026-07-17
+(ADR-0013):** `CliAdapter::dispatch()` for claude (stream-json, defensive
+NDJSON parsing) and agy (plain-text synthesis on an app-serialized lane;
+`Edits` posture and `follow_up` refused inside the adapter until the ⬜
+supervised verifications land), claude `follow_up()` (resume in the record's
+cwd), the Home dispatch form (`i`) and broadcast form + side-by-side compare
+surface (`b`), the dispatch timeline, first real writers for the `dispatches`
+table, and the one-live-handle promote rule below. Event delivery is
+synchronous-polled (reader thread + std mpsc, drained on the 33 ms tick — no
+async trait). `defaults.dispatch`/`defaults.broadcast` are consumed for real.
+No registry schema change (v3 stays).
 
 ## The two channels (ADR-0001)
 
@@ -151,10 +162,12 @@ integration page.
    several (broadcast), or a saved routing rule. The router attaches guardrail defaults
    (below) and a working directory — cwd is part of the task, not ambient state, because
    Claude Code scopes session-ID resolution to the project directory.
-2. **Dispatch.** `adapter.dispatch(task) -> EventStream`. The adapter builds the exact
-   command line, spawns the child through tokio, and begins translating output.
-   For Claude Code the adapter may instead hand long tasks to the native background
-   supervisor (`claude --bg`) and poll `claude agents --json` — same events either way.
+2. **Dispatch.** `adapter.dispatch(task) -> DispatchHandle`. The adapter builds the
+   exact command line and spawns the child on a reader thread that translates output
+   into events on a std mpsc channel; the app drains it on the 33 ms tick (ADR-0013 —
+   no async trait). For Claude Code the adapter may later hand long tasks to the native
+   background supervisor (`claude --bg`) and poll `claude agents --json` — recorded as
+   the long-task option, not the default channel.
 3. **Normalization.** Tool output becomes `AgentEvent`s on the bus:
 
    | `AgentEvent` | claude (stream-json) | codex (`--json` JSONL) | agy (plain text) |
@@ -167,8 +180,9 @@ integration page.
 
 4. **Fan-out.** The home timeline renders events live; the registry upserts the session
    record (`native_id`, status, last activity) on `Started`/`Completed`/`Failed`.
-5. **Promotion (optional).** From the roster the user opens the session as a tab; the
-   adapter's `attach(record)` spawns the interactive resume command in a PTY and the
+5. **Promotion (optional).** From the roster the user opens the session as a tab: the
+   app spawns the adapter's `interactive_cmd(Resume { native_id }, …)` in a PTY — in
+   the record's own cwd, because resume-by-id lookup is scoped to it — and the
    session view takes over rendering. From here the underlying CLI's own approval and
    subagent UX applies untouched.
 6. **Exit.** Tab close kills only the PTY child (the native session transcript persists
@@ -204,12 +218,13 @@ fourth adapter "a spawn command plus a probe" (ADR-0006).
 - **Orchestrator crash** → registry is durable; native transcripts are the source of
   truth; on restart, reconciliation re-reads `claude agents --json` and the native
   session stores (read-only) to re-adopt live/background sessions.
-- **Two tabs on one native session** → registry enforces one live handle per native ID;
-  a second open offers fork instead (`--fork-session` / `codex fork` — the latter is
-  TUI-only, which is fine, since promotion is interactive by definition; agy `/fork`).
-  **Not implemented yet in this milestone** — the fork-offer described here doesn't
-  exist; nothing currently prevents two tabs from pointing at the same `native_id`;
-  deferred.
+- **Two tabs on one native session** → **implemented (milestone 3, ADR-0013):** the
+  app enforces one live handle per native ID — Enter on a session whose native id is
+  already attached (an open pane or a running dispatch, on any row) focuses the
+  existing tab instead of spawning a second process, and promoting a still-running
+  dispatch asks before stop-and-resume. The **fork-offer** (`--fork-session` /
+  `codex fork` / agy `/fork`) stays deferred until its semantics are live-verified;
+  today a second open focuses, never forks.
 - **Credential exposure** → adapters are forbidden (AGENTS.md boundary + code review
   rule) from opening credential files; the probe checks path existence only.
 

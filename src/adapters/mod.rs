@@ -14,9 +14,13 @@ pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
 
+use std::collections::VecDeque;
+use std::io::BufRead;
 use std::path::Path;
-use std::process::{Child, Command};
-use std::sync::mpsc::Receiver;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::core::events::AgentEvent;
 use crate::core::session::SessionRecord;
@@ -37,6 +41,11 @@ pub struct AdapterCaps {
     /// the installed binary's `--help`, so upstream drift degrades to "field
     /// hidden in the picker", never a broken spawn.
     pub launch: LaunchOptionsDecl,
+    /// At most one headless dispatch of this tool at a time (ADR-0013;
+    /// ADR-0002's serialized agy lane — its `-c`-based follow-up story only
+    /// works if "most recent conversation" is unambiguous). The app enforces
+    /// it; caps-driven so the app never branches on adapter identity.
+    pub serial_dispatch: bool,
 }
 
 /// Per-tool declaration of the launch options `interactive_cmd` can map
@@ -125,12 +134,166 @@ pub struct NativeCommand {
     pub persists: bool,
 }
 
-/// A running headless dispatch: normalized events plus the child to reap.
-/// TODO(next session): becomes an async stream once tokio lands (ADR-0005);
-/// the std `mpsc` shape here exists only to pin the boundary dependency-free.
+/// A running headless dispatch: normalized events plus a stop lever
+/// (ADR-0013). The spawning adapter's reader thread owns the child — it
+/// parses stdout to EOF, reaps the exit status, and synthesizes the terminal
+/// event (per-tool failure semantics stay inside the adapter) — so the app
+/// only ever polls `events` on its render tick and, at most, fires `kill`.
+/// Decided in ADR-0013: this stays a std `mpsc` receiver polled by the tick;
+/// no async trait.
+#[derive(Debug)]
 pub struct DispatchHandle {
     pub events: Receiver<AgentEvent>,
-    pub child: Child,
+    pub kill: DispatchKill,
+}
+
+/// Best-effort stop for a dispatched child. Cloneable so the app can hold
+/// one while the reader thread keeps reaping through the same shared child.
+#[derive(Debug, Clone)]
+pub struct DispatchKill(Arc<Mutex<Child>>);
+
+impl DispatchKill {
+    /// Best-effort kill; the reader thread still observes EOF, reaps, and
+    /// emits the terminal event — callers never reap themselves.
+    pub fn kill(&self) {
+        let _ = lock_ignore_poison(&self.0).kill();
+    }
+}
+
+/// Same poison stance as the PTY layer (findings-ledger F-003): a panicking
+/// holder degrades that dispatch, it doesn't cascade.
+fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Per-tool stdout translation for `spawn_streaming` (ADR-0013): one
+/// implementation per adapter, holding whatever state it needs (e.g. claude
+/// tracks whether the stream's own `result` line already carried the
+/// terminal event). Tool-agnostic — tests drive the runner with `sh` fakes,
+/// never a wrapped CLI.
+pub(crate) trait StreamParser: Send + 'static {
+    /// One stdout line, trailing newline removed.
+    fn on_line(&mut self, line: &str, tx: &Sender<AgentEvent>);
+    /// Process ended. `success` is the reaped exit status; `None` only when
+    /// the child ignored stdout-EOF for 60s and had to be force-killed
+    /// without yielding a status. `stderr_tail` carries the last captured
+    /// stderr lines for failure reasons.
+    fn on_exit(&mut self, success: Option<bool>, stderr_tail: &str, tx: &Sender<AgentEvent>);
+}
+
+/// Spawn `cmd` (env-scrubbed, stdin closed, stdout/stderr piped) and stream
+/// `parser`'s events from a dedicated reader thread (ADR-0013). stderr is
+/// drained concurrently — a full pipe would wedge the child — keeping a
+/// bounded tail of last lines for `on_exit`'s failure reason.
+pub(crate) fn spawn_streaming(
+    mut cmd: Command,
+    mut parser: impl StreamParser,
+) -> Result<DispatchHandle, AdapterError> {
+    scrub_env(&mut cmd);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(AdapterError::Spawn)?;
+    let stdout = child.stdout.take().expect("stdout was piped above");
+    let stderr = child.stderr.take().expect("stderr was piped above");
+    let child = Arc::new(Mutex::new(child));
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
+    let tail_writer = Arc::clone(&stderr_tail);
+    let drainer = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let mut tail = lock_ignore_poison(&tail_writer);
+                    tail.push_back(line.trim_end_matches(['\n', '\r']).to_string());
+                    if tail.len() > 20 {
+                        tail.pop_front();
+                    }
+                }
+            }
+        }
+    });
+
+    let reader_child = Arc::clone(&child);
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => parser.on_line(line.trim_end_matches(['\n', '\r']), &tx),
+            }
+        }
+        // EOF: reap WITHOUT holding the lock across a blocking wait, so
+        // `DispatchKill` can always cut in (the same EOF-vs-exit race shape
+        // the PTY layer polls through — NOTES.md, milestone 2b).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut success = None;
+        loop {
+            match lock_ignore_poison(&reader_child).try_wait() {
+                Ok(Some(status)) => {
+                    success = Some(status.success());
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if Instant::now() >= deadline {
+                // stdout closed but the process lingers: stop it, then give
+                // it one short reap window.
+                let _ = lock_ignore_poison(&reader_child).kill();
+                for _ in 0..100 {
+                    if let Ok(Some(status)) = lock_ignore_poison(&reader_child).try_wait() {
+                        success = Some(status.success());
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // Child is reaped (or force-killed), so stderr has hit EOF and the
+        // drainer is finishing — join it for a complete tail.
+        let _ = drainer.join();
+        let tail = lock_ignore_poison(&stderr_tail)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        parser.on_exit(success, &tail, &tx);
+    });
+
+    Ok(DispatchHandle {
+        events: rx,
+        kill: DispatchKill(child),
+    })
+}
+
+/// AGENTS.md gotcha, subprocess edition (the PTY layer carries its own copy
+/// for portable-pty's `CommandBuilder`): a wrapped CLI spawned from inside
+/// another Claude Code session inherits `CLAUDECODE`/`CLAUDE_CODE_*` and
+/// changes behavior. Every adapter subprocess must look like a plain user
+/// terminal invocation.
+pub(crate) fn scrub_env(cmd: &mut Command) {
+    cmd.env("TERM", "xterm-256color");
+    cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+    cmd.env_remove("CLAUDE_CODE_SSE_PORT");
+    for (key, _) in std::env::vars_os() {
+        if let Some(name) = key.to_str() {
+            if name.starts_with("CLAUDE_CODE_") {
+                cmd.env_remove(name);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -309,7 +472,12 @@ impl CliAdapter for AdapterKind {
 /// path performs is `--version`/`--help` invocations (AGENTS.md boundary:
 /// never touch credential/config file contents).
 pub(crate) fn command_output(binary: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new(binary).args(args).output()
+    let mut cmd = Command::new(binary);
+    cmd.args(args);
+    // Probes and `claude agents --json` are subprocess invocations of a
+    // wrapped CLI too — scrub them like dispatch children (ADR-0013).
+    scrub_env(&mut cmd);
+    cmd.output()
 }
 
 /// `--help`-shaped output as one string (stdout + stderr concatenated, since
@@ -324,6 +492,22 @@ pub(crate) fn help_text(binary: &str, args: &[&str]) -> String {
             String::from_utf8_lossy(&out.stderr)
         ),
         Err(_) => String::new(),
+    }
+}
+
+/// Test-only handle factory: a real receiver whose sender the test holds,
+/// and a kill lever backed by a trivial already-exiting `sh` child — app
+/// tests hand-feed events without ever spawning a wrapped CLI.
+#[cfg(test)]
+pub(crate) fn test_dispatch_handle(events: Receiver<AgentEvent>) -> DispatchHandle {
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(":")
+        .spawn()
+        .expect("spawn trivial child for test handle");
+    DispatchHandle {
+        events,
+        kill: DispatchKill(Arc::new(Mutex::new(child))),
     }
 }
 
@@ -410,6 +594,101 @@ mod tests {
         // ADR-0008/0009: nothing codex is locally verifiable, so its table
         // stays the trait default until reversal.
         assert!(AdapterKind::Codex.command_table().is_empty());
+    }
+
+    /// A tiny tool-agnostic parser for exercising the streaming runner with
+    /// plain `sh` (never a wrapped CLI): every line becomes `AgentText`, the
+    /// exit becomes `Completed`/`Failed` with the stderr tail in the reason.
+    struct EchoParser;
+
+    impl StreamParser for EchoParser {
+        fn on_line(&mut self, line: &str, tx: &Sender<AgentEvent>) {
+            let _ = tx.send(AgentEvent::AgentText(line.to_string()));
+        }
+        fn on_exit(&mut self, success: Option<bool>, stderr_tail: &str, tx: &Sender<AgentEvent>) {
+            let _ = tx.send(match success {
+                Some(true) => AgentEvent::Completed {
+                    result: String::new(),
+                    cost_usd: None,
+                },
+                _ => AgentEvent::Failed {
+                    reason: format!("stderr: {stderr_tail}"),
+                },
+            });
+        }
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    }
+
+    #[test]
+    fn streaming_runner_forwards_lines_then_a_terminal_event() {
+        let handle = spawn_streaming(sh("printf 'a\\nb\\n'"), EchoParser).expect("spawn");
+        // `iter()` ends when the reader thread finishes and drops the sender.
+        let events: Vec<AgentEvent> = handle.events.iter().collect();
+        assert_eq!(events.len(), 3, "got: {events:?}");
+        assert!(matches!(&events[0], AgentEvent::AgentText(t) if t == "a"));
+        assert!(matches!(&events[1], AgentEvent::AgentText(t) if t == "b"));
+        assert!(matches!(&events[2], AgentEvent::Completed { .. }));
+    }
+
+    #[test]
+    fn streaming_runner_reports_failure_with_stderr_tail() {
+        let handle = spawn_streaming(sh("echo oops >&2; exit 3"), EchoParser).expect("spawn");
+        let events: Vec<AgentEvent> = handle.events.iter().collect();
+        match events.last() {
+            Some(AgentEvent::Failed { reason }) => {
+                assert!(reason.contains("oops"), "stderr tail missing: {reason}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_kill_stops_a_running_child_promptly() {
+        let started = Instant::now();
+        let handle = spawn_streaming(sh("sleep 30"), EchoParser).expect("spawn");
+        handle.kill.kill();
+        let events: Vec<AgentEvent> = handle.events.iter().collect();
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Failed { .. })),
+            "killed child must land Failed, got {events:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "kill took {:?} — the 30s sleep won the race",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn spawned_children_get_the_env_scrub() {
+        // The caller "inherits" a Claude Code environment; the child must not.
+        let mut cmd = sh("env");
+        cmd.env("CLAUDECODE", "1");
+        cmd.env("CLAUDE_CODE_ENTRYPOINT", "cli");
+        let handle = spawn_streaming(cmd, EchoParser).expect("spawn");
+        let lines: Vec<String> = handle
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::AgentText(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            lines.iter().any(|l| l == "TERM=xterm-256color"),
+            "plain TERM missing:\n{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("CLAUDECODE=") || l.starts_with("CLAUDE_CODE_")),
+            "Claude Code env leaked into a dispatch child:\n{lines:?}"
+        );
     }
 
     /// The `persists` flags are copies of the ✅-verified "Persists" column in

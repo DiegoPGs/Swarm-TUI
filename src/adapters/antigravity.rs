@@ -11,13 +11,15 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc::Sender;
 
 use super::{
     AdapterCaps, AdapterError, CliAdapter, DispatchHandle, LaunchIntent, LaunchOptions,
-    LaunchOptionsDecl, NativeCommand, ResumeSupport, StructuredOutput,
+    LaunchOptionsDecl, NativeCommand, ResumeSupport, StreamParser, StructuredOutput,
 };
+use crate::core::events::AgentEvent;
 use crate::core::session::SessionRecord;
-use crate::core::task::Task;
+use crate::core::task::{DispatchPosture, Task};
 
 pub struct Antigravity;
 
@@ -39,6 +41,9 @@ pub const EXPECTED_CAPS: AdapterCaps = AdapterCaps {
         model: Some(MODEL_SUGGESTIONS),
         effort: None, // agy has no effort flag; depth rides on the model variant
     },
+    // ADR-0013: one agy headless run at a time — native-id backfill is ⬜,
+    // so "most recent conversation" must stay unambiguous (ADR-0002 lane).
+    serial_dispatch: true,
 };
 
 /// Palette table (ADR-0009): every entry is ✅ *(local 2026-07-16)* in
@@ -252,6 +257,7 @@ impl CliAdapter for Antigravity {
             resume,
             background_supervisor: EXPECTED_CAPS.background_supervisor,
             launch,
+            serial_dispatch: EXPECTED_CAPS.serial_dispatch,
         })
     }
 
@@ -279,28 +285,100 @@ impl CliAdapter for Antigravity {
         COMMANDS
     }
 
-    fn dispatch(&self, _task: &Task) -> Result<DispatchHandle, AdapterError> {
-        // TODO(next session):
-        //   agy -p <prompt> --print-timeout <task budget-ish>   (in task.cwd)
-        // Synthesize events from process lifecycle + stdout as AgentText.
-        // ⬜ unverified (verify-clis.sh + one live run):
-        //   * does -p create a resumable conversation? if yes, backfill
-        //     native_id via the ADR-0002 lane (serialized `-c` follow-up, or
-        //     conversation-store lookup by timestamp);
-        //   * -p permission behavior with no TTY — until known, router policy
-        //     is read-oriented tasks only (ARCHITECTURE guardrail table).
-        todo!("headless dispatch via agy -p, synthesized events (ADR-0001)")
+    /// Headless dispatch (ADR-0013): `agy -p` plain text with synthesized
+    /// events. `Edits` posture is refused here — how `request-review`
+    /// behaves under `-p` with no TTY is ⬜ (integration page; settling it
+    /// is a supervised live run) — so only read/plan-shaped tasks flow.
+    /// Whether `-p` creates a resumable conversation is equally ⬜: rows
+    /// keep `native_id: None` until the owner's supervised backfill
+    /// verification (ADR-0002 lane).
+    fn dispatch(&self, task: &Task) -> Result<DispatchHandle, AdapterError> {
+        if task.budget.posture == DispatchPosture::Edits {
+            return Err(AdapterError::Unsupported(
+                "agy headless edits: -p permission behavior is unverified — read/plan tasks only",
+            ));
+        }
+        let cmd = self.headless_cmd(task);
+        super::spawn_streaming(cmd, AgyTextParser::default())
     }
 
+    /// ⬜ whether `--conversation <ID>` combines with `-p` at all — a
+    /// supervised live verification (integration page). Refused until then.
     fn follow_up(
         &self,
         _session: &SessionRecord,
         _task: &Task,
     ) -> Result<DispatchHandle, AdapterError> {
-        // TODO(next session): agy -p --conversation <native_id> <prompt> —
-        // the flag combo itself is ⬜; if unsupported, fall back to the
-        // serialized `-c` lane (one agy follow-up in flight at a time).
-        todo!("headless follow-up via agy --conversation (ADR-0001/0002)")
+        Err(AdapterError::Unsupported(
+            "agy headless follow-up: --conversation + -p is unverified (run supervised first)",
+        ))
+    }
+}
+
+impl Antigravity {
+    /// Build the headless argv (ADR-0013) — split from `dispatch` so tests
+    /// assert flags without spawning. `max_turns`/`max_usd` have no agy
+    /// mechanism and are ignored; `--print-timeout` (Go duration syntax) is
+    /// the one hard stop, left at the tool's 5m default unless the task
+    /// tightens it.
+    fn headless_cmd(&self, task: &Task) -> Command {
+        let mut cmd = Command::new(self.binary());
+        cmd.arg("-p").arg(&task.prompt);
+        if let Some(secs) = task.budget.timeout_secs {
+            cmd.arg("--print-timeout").arg(format!("{secs}s"));
+        }
+        if let Some(model) = &task.model {
+            cmd.arg("--model").arg(model);
+        }
+        // task.effort: no agy flag (ADR-0009) — ignored.
+        cmd.current_dir(&task.cwd);
+        cmd
+    }
+}
+
+/// Plain-text → `AgentEvent` synthesis (ADR-0001/0013): `Started{None}` on
+/// the first output line (agy reports no id up front — ADR-0002 backfill
+/// lane), every line as `AgentText`, and the terminal event from the exit
+/// status with a bounded tail of the output as the result.
+#[derive(Default)]
+struct AgyTextParser {
+    started: bool,
+    tail: Vec<String>,
+}
+
+impl AgyTextParser {
+    const TAIL_LINES: usize = 100;
+}
+
+impl StreamParser for AgyTextParser {
+    fn on_line(&mut self, line: &str, tx: &Sender<AgentEvent>) {
+        if !self.started {
+            self.started = true;
+            let _ = tx.send(AgentEvent::Started { native_id: None });
+        }
+        if self.tail.len() == Self::TAIL_LINES {
+            self.tail.remove(0);
+        }
+        self.tail.push(line.to_string());
+        if !line.trim().is_empty() {
+            let _ = tx.send(AgentEvent::AgentText(line.to_string()));
+        }
+    }
+
+    fn on_exit(&mut self, success: Option<bool>, stderr_tail: &str, tx: &Sender<AgentEvent>) {
+        let _ = tx.send(match success {
+            Some(true) => AgentEvent::Completed {
+                result: self.tail.join("\n"),
+                cost_usd: None, // agy reports no cost on the -p channel
+            },
+            _ => AgentEvent::Failed {
+                reason: if stderr_tail.is_empty() {
+                    "agy -p exited with a failure".to_string()
+                } else {
+                    stderr_tail.to_string()
+                },
+            },
+        });
     }
 }
 
@@ -313,6 +391,111 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn task(prompt: &str) -> crate::core::task::Task {
+        crate::core::task::Task {
+            prompt: prompt.to_string(),
+            cwd: std::path::PathBuf::from("/tmp/repo"),
+            budget: crate::core::task::Budget::default(),
+            model: None,
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn headless_argv_is_print_plus_optional_timeout_and_model() {
+        // Defaults: bare -p, tool's own 5m timeout, no model.
+        let cmd = Antigravity.headless_cmd(&task("summarize the readme"));
+        assert_eq!(cmd.get_program(), "agy");
+        assert_eq!(argv(&cmd), ["-p", "summarize the readme"]);
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/repo")));
+
+        // Tightened: timeout in Go-duration seconds + model verbatim;
+        // turns/usd have no agy mechanism and must not appear.
+        let mut t = task("scan the docs");
+        t.budget.timeout_secs = Some(300);
+        t.budget.max_turns = Some(9);
+        t.budget.max_usd = Some(1.0);
+        t.model = Some("gemini-3.1-pro".to_string());
+        let cmd = Antigravity.headless_cmd(&t);
+        assert_eq!(
+            argv(&cmd),
+            [
+                "-p",
+                "scan the docs",
+                "--print-timeout",
+                "300s",
+                "--model",
+                "gemini-3.1-pro",
+            ]
+        );
+    }
+
+    #[test]
+    fn edits_posture_is_refused_and_follow_up_stays_unsupported() {
+        let mut t = task("apply the fix");
+        t.budget.posture = crate::core::task::DispatchPosture::Edits;
+        match Antigravity.dispatch(&t) {
+            Err(AdapterError::Unsupported(reason)) => {
+                assert!(reason.contains("unverified"), "got: {reason}")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+
+        let record = SessionRecord {
+            id: 1,
+            tool: "antigravity".to_string(),
+            native_id: Some("conv-9".to_string()),
+            name: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: crate::core::session::SessionMode::Headless,
+            status: crate::core::session::SessionStatus::Completed,
+            created_at: std::time::SystemTime::now(),
+            updated_at: std::time::SystemTime::now(),
+            cost_usd: None,
+            model: None,
+            effort: None,
+            role: None,
+        };
+        assert!(matches!(
+            Antigravity.follow_up(&record, &task("more")),
+            Err(AdapterError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn text_parser_synthesizes_started_text_and_terminal_events() {
+        let run = |lines: &[&str], exit: Option<bool>, stderr: &str| -> Vec<AgentEvent> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut parser = AgyTextParser::default();
+            for line in lines {
+                parser.on_line(line, &tx);
+            }
+            parser.on_exit(exit, stderr, &tx);
+            drop(tx);
+            rx.iter().collect()
+        };
+
+        let events = run(&["hello", "world"], Some(true), "");
+        assert_eq!(events.len(), 4, "got {events:?}");
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Started { native_id: None }
+        ));
+        assert!(matches!(&events[1], AgentEvent::AgentText(t) if t == "hello"));
+        assert!(matches!(&events[2], AgentEvent::AgentText(t) if t == "world"));
+        match &events[3] {
+            AgentEvent::Completed { result, cost_usd } => {
+                assert_eq!(result, "hello\nworld");
+                assert_eq!(*cost_usd, None);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        let events = run(&[], Some(false), "quota exceeded");
+        assert_eq!(events.len(), 1, "no output ⇒ terminal only, got {events:?}");
+        assert!(matches!(&events[0], AgentEvent::Failed { reason } if reason.contains("quota")));
     }
 
     #[test]

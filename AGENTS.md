@@ -4,9 +4,10 @@ Terminal orchestrator (Rust, ratatui) that wraps the locally installed Claude Co
 and Antigravity CLI (`agy`): per-service interactive session tabs plus a home view
 that routes cross-agent work. The Codex CLI integration is **suspended**
 (ADR-0008) — its adapter stays compiled for reversal but is never probed, offered,
-or spawned. Maturity: **early implementation** — the milestone-2a shell is real
-(`cargo run` boots tabs, roster, and live PTY sessions); no headless orchestration
-logic yet. The single thing an agent must never break: **swarm-tui reuses the
+or spawned. Maturity: **mid implementation** — the shell (milestones 2a–2d) and the
+programmatic plane (milestone 3: headless dispatch, broadcast-and-compare, the
+one-live-handle promote rule; ADR-0013) are real; pipelines and MCP integration are
+not. The single thing an agent must never break: **swarm-tui reuses the
 wrapped CLIs' existing local logins and config; it must never trigger a new auth flow or
 read, print, or copy the contents of any credential file** (`~/.codex/auth.json`,
 anything under `~/.claude/`, `~/.gemini/`, or the OS keyring). Checking that these paths

@@ -12,9 +12,11 @@
 //! appears here, the adapter boundary (ADR-0006) has leaked — fix the
 //! boundary, not this module.
 
+pub mod dispatch;
 pub mod home;
 pub mod keys;
 pub mod palette;
+pub mod promote;
 pub mod reconcile;
 pub mod session_view;
 pub mod startup;
@@ -41,6 +43,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use crate::adapters::claude_code::ClaudeCode;
 use crate::adapters::{self, AdapterCaps, AdapterError, AdapterKind, CliAdapter};
 use crate::core::config::SwarmTuiConfig;
+use crate::core::events::AgentEvent;
 use crate::core::plan::{Role, SwarmPlan};
 use crate::core::session::{SessionMode, SessionRecord, SessionStatus};
 use crate::pty::local::LocalPaneHost;
@@ -154,6 +157,12 @@ pub enum ConfirmAction {
     StartupInjection {
         session_id: SessionId,
     },
+    /// Enter on a roster row whose headless dispatch is still running
+    /// (ADR-0013 decision 6): `y` stops the run, finalizes its rows, then
+    /// resumes the native session interactively in a fresh pane.
+    PromoteRunningDispatch {
+        session_id: SessionId,
+    },
 }
 
 /// The new-session picker, now two-stage (ADR-0009): choose a tool, then —
@@ -173,6 +182,16 @@ pub enum PickerState {
         /// 0 = tool default (send nothing); 1.. indexes `decl.effort`.
         effort_idx: usize,
     },
+}
+
+/// Truncate for one-line surfaces (timeline rows), char-boundary safe.
+fn truncate_line(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
 }
 
 fn is_ctrl_space(key: &KeyEvent) -> bool {
@@ -331,6 +350,19 @@ pub struct App {
     /// tab bar row. Recomputed every `draw()` call so it tracks real resizes
     /// without needing a dedicated `Event::Resize` handler.
     pane_area_size: PaneSize,
+    /// Live + finished headless dispatches, keyed by their registry session
+    /// id (ADR-0013); events fold in on the tick via `drive_dispatches`.
+    pub dispatches: HashMap<SessionId, dispatch::RunningDispatch>,
+    /// The Home-local dispatch form (`i`), when open.
+    pub dispatch_form: Option<dispatch::DispatchForm>,
+    /// Recent dispatch activity one-liners for the Home timeline panel.
+    pub timeline: std::collections::VecDeque<String>,
+    /// The Home-local broadcast form (`b`), when open.
+    pub broadcast_form: Option<dispatch::BroadcastForm>,
+    /// The active broadcast's compare surface (ADR-0013). Presentation only:
+    /// Esc dismisses it without touching the underlying dispatches; a new
+    /// broadcast replaces it.
+    pub broadcast: Option<dispatch::BroadcastGroup>,
 }
 
 /// Query Claude Code's native background-agent supervisor (ADR-0002
@@ -439,6 +471,11 @@ impl App {
                 usage: HashMap::new(),
                 probes: HashMap::new(),
                 pane_area_size,
+                dispatches: HashMap::new(),
+                dispatch_form: None,
+                timeline: std::collections::VecDeque::new(),
+                broadcast_form: None,
+                broadcast: None,
             },
             pane_changed_rx,
         ))
@@ -674,6 +711,14 @@ impl App {
             self.handle_palette_key(key);
             return false;
         }
+        if self.dispatch_form.is_some() {
+            self.handle_dispatch_form_key(key);
+            return false;
+        }
+        if self.broadcast_form.is_some() {
+            self.handle_broadcast_form_key(key);
+            return false;
+        }
         if self.show_keymap_overlay {
             // Any key dismisses the overlay; ADR-0007 leaves the exact
             // indicator/dismiss UX to the implementation. Swallow the
@@ -739,14 +784,551 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.home.select_prev(),
             KeyCode::Down | KeyCode::Char('j') => self.home.select_next(),
-            KeyCode::Enter => {
-                if let Some(session_id) = self.home.selected_session_id() {
-                    if home::is_detached(session_id, &self.pane_of_session, &self.tabs) {
-                        self.tabs.promote(session_id);
+            KeyCode::Char('i') => self.open_dispatch_form(),
+            KeyCode::Char('b') => self.open_broadcast_form(),
+            KeyCode::Esc if self.broadcast.is_some() => self.broadcast = None,
+            KeyCode::Enter => self.promote_selected(),
+            _ => {}
+        }
+    }
+
+    /// Home-local `i` (ADR-0013): open the dispatch form, prefilled from the
+    /// workspace's `defaults.dispatch` and preselecting `default_role`.
+    fn open_dispatch_form(&mut self) {
+        let targets = dispatch::targets(self.plan.as_ref(), |kind| {
+            matches!(self.probe_cache.get(&kind), Some(Ok(_)))
+        });
+        if targets.iter().all(|t| !t.enabled) {
+            self.push_timeline("✗ dispatch: no installed tool to target".to_string());
+            return;
+        }
+        let budget = crate::core::task::budget_from_workspace(
+            self.plan
+                .as_ref()
+                .and_then(|plan| plan.defaults.dispatch.as_ref()),
+        );
+        let preselect = self
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.defaults.default_role.clone());
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.dispatch_form = Some(dispatch::DispatchForm::new(
+            targets,
+            preselect.as_deref(),
+            budget,
+            cwd,
+        ));
+    }
+
+    fn handle_dispatch_form_key(&mut self, key: KeyEvent) {
+        let Some(mut form) = self.dispatch_form.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {} // drop the form
+            KeyCode::Enter => match form.submit() {
+                Ok((target, task)) => {
+                    if self.serial_lane_busy(target.kind) {
+                        // ADR-0013 serialized lane (caps-driven, ADR-0002):
+                        // the form stays open with the reason.
+                        form.error =
+                            Some(format!("{}: one headless run at a time", target.kind.id()));
+                        self.dispatch_form = Some(form);
+                    } else {
+                        let _ = self.start_dispatch(target, task);
+                    }
+                }
+                Err(msg) => {
+                    form.error = Some(msg);
+                    self.dispatch_form = Some(form);
+                }
+            },
+            _ => {
+                form.handle_key(key);
+                self.dispatch_form = Some(form);
+            }
+        }
+    }
+
+    /// Home-local `b` (ADR-0013): open the broadcast form. Preselection is
+    /// the workspace's `defaults.broadcast` role names — naming a role there
+    /// is the explicit opt-in for its tool (PRODUCT Q5); everything else
+    /// starts unticked and ticking is the per-task opt-in.
+    fn open_broadcast_form(&mut self) {
+        let targets = dispatch::targets(self.plan.as_ref(), |kind| {
+            matches!(self.probe_cache.get(&kind), Some(Ok(_)))
+        });
+        if targets.iter().all(|t| !t.enabled) {
+            self.push_timeline("✗ broadcast: no installed tool to target".to_string());
+            return;
+        }
+        let budget = crate::core::task::budget_from_workspace(
+            self.plan
+                .as_ref()
+                .and_then(|plan| plan.defaults.dispatch.as_ref()),
+        );
+        let preticked = self
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.defaults.broadcast.clone())
+            .unwrap_or_default();
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.broadcast_form = Some(dispatch::BroadcastForm::new(
+            targets, &preticked, budget, cwd,
+        ));
+    }
+
+    fn handle_broadcast_form_key(&mut self, key: KeyEvent) {
+        let Some(mut form) = self.broadcast_form.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {} // drop the form
+            KeyCode::Enter => match form.submit() {
+                Ok(picked) => {
+                    if let Some(msg) = self.serial_conflict(&picked) {
+                        form.error = Some(msg);
+                        self.broadcast_form = Some(form);
+                    } else {
+                        self.run_broadcast(picked);
+                    }
+                }
+                Err(msg) => {
+                    form.error = Some(msg);
+                    self.broadcast_form = Some(form);
+                }
+            },
+            _ => {
+                form.handle_key(key);
+                self.broadcast_form = Some(form);
+            }
+        }
+    }
+
+    /// A broadcast must not double-book a serialized lane (ADR-0013): a tool
+    /// declaring `serial_dispatch` gets at most one target per broadcast, and
+    /// none while its lane is already busy. Dispatching some columns now and
+    /// holding others would compare nothing — refuse at submit instead.
+    fn serial_conflict(
+        &self,
+        picked: &[(dispatch::Target, crate::core::task::Task)],
+    ) -> Option<String> {
+        let mut seen: Vec<AdapterKind> = Vec::new();
+        for (target, _) in picked {
+            let serial = matches!(
+                self.probe_cache.get(&target.kind),
+                Some(Ok(caps)) if caps.serial_dispatch
+            );
+            if !serial {
+                continue;
+            }
+            if seen.contains(&target.kind) {
+                return Some(format!(
+                    "{}: one headless run at a time — untick all but one",
+                    target.kind.id()
+                ));
+            }
+            if self.serial_lane_busy(target.kind) {
+                return Some(format!("{}: one headless run at a time", target.kind.id()));
+            }
+            seen.push(target.kind);
+        }
+        None
+    }
+
+    /// Fire one dispatch per ticked target and set up the compare surface.
+    /// Individual failures surface on the timeline exactly like single
+    /// dispatches; only started targets get columns.
+    fn run_broadcast(&mut self, picked: Vec<(dispatch::Target, crate::core::task::Task)>) {
+        let prompt = picked
+            .first()
+            .map(|(_, task)| task.prompt.clone())
+            .unwrap_or_default();
+        self.push_timeline(format!(
+            "⇉ broadcast: {} targets: {}",
+            picked.len(),
+            truncate_line(&prompt, 50)
+        ));
+        let mut columns = Vec::new();
+        for (target, task) in picked {
+            let label = target
+                .role
+                .clone()
+                .unwrap_or_else(|| target.kind.id().to_string());
+            if let Some(session_id) = self.start_dispatch(target, task) {
+                columns.push(dispatch::BroadcastColumn::new(session_id, label));
+            }
+        }
+        if !columns.is_empty() {
+            self.broadcast = Some(dispatch::BroadcastGroup { columns });
+        }
+    }
+
+    // -- promote hardening (ADR-0013 decision 6) -----------------------------
+
+    /// Home Enter: one live handle per native session. The decision itself
+    /// is pure (`promote::decide`); this arm assembles the live snapshot and
+    /// executes the verdict.
+    fn promote_selected(&mut self) {
+        let Some(session_id) = self.home.selected_session_id() else {
+            return; // reconciled-only rows have no registry row to attach
+        };
+        let Some(record) = self.record_for(session_id).cloned() else {
+            return;
+        };
+        let snap = self.attachment_snapshot(session_id, &record);
+        match promote::decide(&record, &snap) {
+            promote::PromoteAction::FocusExisting { session_id } => {
+                self.tabs.promote(session_id);
+            }
+            promote::PromoteAction::ConfirmStopDispatch { session_id } => {
+                self.pending_confirm = Some(ConfirmAction::PromoteRunningDispatch { session_id });
+            }
+            promote::PromoteAction::ResumeHeadless { session_id } => {
+                // The row is already finished — a failed spawn leaves its
+                // real outcome alone and just reports.
+                if let Err(msg) = self.resume_into_tab(session_id) {
+                    self.push_timeline(format!("✗ #{session_id} resume failed: {msg}"));
+                }
+            }
+            promote::PromoteAction::NotPromotable { reason } => {
+                self.push_timeline(format!("✗ #{session_id} promote: {reason}"));
+            }
+        }
+    }
+
+    /// Live-attachment snapshot for `promote::decide`: a native_id may be
+    /// held by an open pane or a live dispatch on any session row; the join
+    /// goes through the roster records. Resume capability comes from the
+    /// probed caps — `app` never names a tool (ADR-0006).
+    fn attachment_snapshot(
+        &self,
+        session_id: SessionId,
+        record: &SessionRecord,
+    ) -> promote::AttachmentSnapshot {
+        let selected_has_pane = self.pane_of_session.contains_key(&session_id);
+        let selected_has_running_dispatch =
+            self.dispatches.get(&session_id).is_some_and(|d| !d.done);
+        let native_attached_elsewhere = record.native_id.as_deref().and_then(|native| {
+            self.home.roster.iter().find_map(|entry| {
+                let RosterEntry::Registered(other) = entry else {
+                    return None;
+                };
+                if other.id == session_id || other.native_id.as_deref() != Some(native) {
+                    return None;
+                }
+                if self.pane_of_session.contains_key(&other.id) {
+                    Some((other.id, promote::Attachment::Pane))
+                } else if self.dispatches.get(&other.id).is_some_and(|d| !d.done) {
+                    Some((other.id, promote::Attachment::Dispatch))
+                } else {
+                    None
+                }
+            })
+        });
+        let resume_by_id = AdapterKind::from_slug(&record.tool).is_some_and(|kind| {
+            matches!(
+                self.probe_cache.get(&kind),
+                Some(Ok(caps)) if caps.resume == adapters::ResumeSupport::ById
+            )
+        });
+        promote::AttachmentSnapshot {
+            selected_has_pane,
+            selected_has_running_dispatch,
+            native_attached_elsewhere,
+            resume_by_id,
+        }
+    }
+
+    /// The registry→tab bridge (ADR-0013 decision 6): resume a finished
+    /// headless row's native session interactively in a fresh pane, reusing
+    /// the same registry row — one row per native id keeps the one-handle
+    /// guard's lookup unambiguous; the headless provenance stays in the
+    /// `dispatches` table. Runs in the RECORD's cwd: resume-by-id lookup is
+    /// scoped to it (AGENTS.md gotcha).
+    fn resume_into_tab(&mut self, session_id: SessionId) -> Result<(), String> {
+        let Some(record) = self.record_for(session_id).cloned() else {
+            return Err("row vanished from the roster".to_string());
+        };
+        let Some(kind) = AdapterKind::from_slug(&record.tool) else {
+            return Err(format!("unknown tool {}", record.tool));
+        };
+        let Some(native_id) = record.native_id.clone() else {
+            return Err("no native session id".to_string());
+        };
+        let intent = adapters::LaunchIntent::Resume { native_id };
+        let opts = adapters::LaunchOptions {
+            model: record.model.clone(),
+            effort: record.effort.clone(),
+        };
+        let cmd = kind.interactive_cmd(&intent, &opts, &record.cwd);
+        let pane_id = self
+            .pane_host
+            .spawn(cmd, self.pane_area_size)
+            .map_err(|e| format!("spawn failed: {e:?}"))?;
+        self.pane_of_session.insert(session_id, pane_id);
+        self.tabs.promote(session_id);
+        self.update_session_row(session_id, |record| {
+            record.status = SessionStatus::Running;
+            record.mode = SessionMode::Interactive;
+        });
+        let _ = self.refresh_roster();
+        Ok(())
+    }
+
+    /// Stop a running dispatch ahead of an interactive resume (ADR-0013):
+    /// the handle leaves the map FIRST so the tick never polls it again —
+    /// the reader thread's post-kill sends drop silently (its receiver is
+    /// gone) and it still reaps the child. A run that finished between
+    /// raising the confirm and answering it keeps its real outcome. The
+    /// kill is fire-and-forget: the resume that follows may overlap the
+    /// dying process for a few milliseconds while the reader thread reaps
+    /// (SIGKILL teardown vs. interactive boot time — acceptable).
+    fn stop_running_dispatch(&mut self, session_id: SessionId) {
+        let Some(disp) = self.dispatches.remove(&session_id) else {
+            return;
+        };
+        if disp.done {
+            return;
+        }
+        disp.handle.kill.kill();
+        if let Some(row) = disp.dispatch_row {
+            if let Err(e) = self
+                .registry
+                .finalize_dispatch(row, "stopped for promote", None)
+            {
+                tracing::warn!(session_id, "dispatch finalize failed: {e:?}");
+            }
+        }
+        self.push_timeline(format!("■ #{session_id} stopped for promote"));
+    }
+
+    /// Whether `kind` declares `serial_dispatch` (ADR-0013) and already has
+    /// a live headless run — the app enforces the one-lane rule without
+    /// ever naming a tool (caps-driven, ADR-0006).
+    fn serial_lane_busy(&self, kind: AdapterKind) -> bool {
+        let serial = matches!(
+            self.probe_cache.get(&kind),
+            Some(Ok(caps)) if caps.serial_dispatch
+        );
+        serial && self.dispatches.values().any(|d| d.kind == kind && !d.done)
+    }
+
+    fn push_timeline(&mut self, line: String) {
+        self.timeline.push_back(line);
+        while self.timeline.len() > 200 {
+            self.timeline.pop_front();
+        }
+    }
+
+    /// Spawn one headless dispatch (ADR-0013): adapter builds and runs the
+    /// command; the registry gets a Headless/Running session row plus a
+    /// `dispatches` row; events fold in on the tick. Failures surface on the
+    /// timeline — never a crash. Returns the session id when the dispatch
+    /// actually started (broadcast builds its compare columns from it).
+    fn start_dispatch(
+        &mut self,
+        target: dispatch::Target,
+        task: crate::core::task::Task,
+    ) -> Option<SessionId> {
+        let handle = match target.kind.dispatch(&task) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.push_timeline(format!("✗ {}: dispatch failed: {e:?}", target.kind.id()));
+                return None;
+            }
+        };
+        let now = SystemTime::now();
+        let record = SessionRecord {
+            id: 0, // assigned by create()
+            tool: target.kind.id().to_string(),
+            native_id: None, // learned from the Started event
+            name: None,
+            cwd: task.cwd.clone(),
+            mode: SessionMode::Headless,
+            status: SessionStatus::Running,
+            created_at: now,
+            updated_at: now,
+            cost_usd: None,
+            model: task.model.clone(),
+            effort: task.effort.clone(),
+            role: target.role.clone(),
+        };
+        let session_id = match self.registry.create(&record) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("dispatch registry create failed: {e:?}");
+                self.push_timeline(format!("✗ registry error, dispatch aborted: {e:?}"));
+                handle.kill.kill();
+                return None;
+            }
+        };
+        let dispatch_row = match self.registry.record_dispatch(
+            session_id,
+            target.kind.id(),
+            &task.prompt,
+            &task.cwd,
+        ) {
+            Ok(row) => Some(row),
+            Err(e) => {
+                tracing::warn!("dispatches insert failed: {e:?}");
+                None
+            }
+        };
+        self.dispatches.insert(
+            session_id,
+            dispatch::RunningDispatch {
+                handle,
+                kind: target.kind,
+                done: false,
+                dispatch_row,
+            },
+        );
+        let label = target.role.as_deref().unwrap_or(target.kind.id());
+        self.push_timeline(format!(
+            "▸ #{session_id} {label}: {}",
+            truncate_line(&task.prompt, 60)
+        ));
+        let _ = self.refresh_roster();
+        Some(session_id)
+    }
+
+    /// Fold pending dispatch events into the registry, timeline, and roster
+    /// (ADR-0013). Called from the tick; returns true when anything changed.
+    fn drive_dispatches(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        // Pass 1: drain channels (mutably borrows the dispatch map only).
+        let mut folded: Vec<(SessionId, AgentEvent)> = Vec::new();
+        for (&session_id, disp) in self.dispatches.iter_mut() {
+            if disp.done {
+                continue;
+            }
+            loop {
+                match disp.handle.events.try_recv() {
+                    Ok(event) => {
+                        if matches!(
+                            event,
+                            AgentEvent::Completed { .. } | AgentEvent::Failed { .. }
+                        ) {
+                            disp.done = true;
+                        }
+                        folded.push((session_id, event));
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        if !disp.done {
+                            // The reader thread always sends a terminal
+                            // event; a bare disconnect means it died.
+                            disp.done = true;
+                            folded.push((
+                                session_id,
+                                AgentEvent::Failed {
+                                    reason: "event stream ended unexpectedly".to_string(),
+                                },
+                            ));
+                        }
+                        break;
                     }
                 }
             }
-            _ => {}
+        }
+
+        // Pass 2: apply (borrows registry/timeline freely).
+        let changed = !folded.is_empty();
+        let mut roster_dirty = false;
+        for (session_id, event) in folded {
+            // The compare surface folds alongside — never instead of — the
+            // registry/timeline fold below (ADR-0013 decision 5).
+            if let Some(group) = self.broadcast.as_mut() {
+                group.fold(session_id, &event);
+            }
+            match event {
+                AgentEvent::Started { native_id } => {
+                    if let Some(native_id) = native_id {
+                        self.update_session_row(session_id, |record| {
+                            record.native_id = Some(native_id.clone());
+                        });
+                        roster_dirty = true;
+                    }
+                    self.push_timeline(format!("· #{session_id} started"));
+                }
+                AgentEvent::AgentText(text) => {
+                    let first = text.lines().next().unwrap_or("");
+                    self.push_timeline(format!("· #{session_id} {}", truncate_line(first, 70)));
+                }
+                AgentEvent::ToolActivity(tool) => {
+                    self.push_timeline(format!("· #{session_id} [{tool}]"));
+                }
+                AgentEvent::Completed { result, cost_usd } => {
+                    self.update_session_row(session_id, |record| {
+                        record.status = SessionStatus::Completed;
+                        record.cost_usd = cost_usd;
+                    });
+                    self.finalize_dispatch_row(session_id, "completed", cost_usd);
+                    let cost = cost_usd.map(|c| format!(" (${c:.2})")).unwrap_or_default();
+                    self.push_timeline(format!(
+                        "✓ #{session_id} completed{cost}: {}",
+                        truncate_line(result.lines().next().unwrap_or(""), 60)
+                    ));
+                    roster_dirty = true;
+                }
+                AgentEvent::Failed { reason } => {
+                    self.update_session_row(session_id, |record| {
+                        record.status = SessionStatus::Failed;
+                    });
+                    self.finalize_dispatch_row(session_id, "failed", None);
+                    self.push_timeline(format!(
+                        "✗ #{session_id} failed: {}",
+                        truncate_line(reason.lines().next().unwrap_or(""), 60)
+                    ));
+                    roster_dirty = true;
+                }
+            }
+        }
+        if roster_dirty {
+            let _ = self.refresh_roster();
+        }
+        changed
+    }
+
+    /// Read-modify-upsert one session row; load failures are warned, never
+    /// fatal (findings-ledger F-002 stance).
+    fn update_session_row(
+        &mut self,
+        session_id: SessionId,
+        apply: impl FnOnce(&mut SessionRecord),
+    ) {
+        match self.registry.all() {
+            Ok(mut records) => {
+                if let Some(record) = records.iter_mut().find(|r| r.id == session_id) {
+                    apply(record);
+                    record.updated_at = SystemTime::now();
+                    if let Err(e) = self.registry.upsert(record) {
+                        tracing::warn!(session_id, "dispatch status write failed: {e:?}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(session_id, "dispatch registry read failed: {e:?}");
+            }
+        }
+    }
+
+    fn finalize_dispatch_row(&mut self, session_id: SessionId, outcome: &str, cost: Option<f64>) {
+        let Some(row) = self
+            .dispatches
+            .get(&session_id)
+            .and_then(|d| d.dispatch_row)
+        else {
+            return;
+        };
+        if let Err(e) = self.registry.finalize_dispatch(row, outcome, cost) {
+            tracing::warn!(session_id, "dispatch finalize failed: {e:?}");
         }
     }
 
@@ -854,7 +1436,8 @@ impl App {
                 self.show_keymap_overlay = !self.show_keymap_overlay;
             }
             KeyCode::Char('q') => {
-                if self.pane_of_session.is_empty() {
+                let dispatches_running = self.dispatches.values().any(|d| !d.done);
+                if self.pane_of_session.is_empty() && !dispatches_running {
                     // Session panes are gone; make sure no hidden probe pane
                     // outlives the app either (ADR-0011).
                     self.kill_probe_panes();
@@ -1003,14 +1586,51 @@ impl App {
             }
             ConfirmAction::Quit => {
                 // Fire-and-forget: a bulk quit-kill doesn't update registry
-                // status (out of scope for a clean-shutdown path) — just
-                // make sure nothing is left running, hidden probe panes
-                // included (ADR-0011).
+                // status for PANES (native transcripts persist and
+                // reconciliation re-adopts them) — just make sure nothing is
+                // left running, hidden probe panes included (ADR-0011).
                 for &pane_id in self.pane_of_session.values() {
                     let _ = self.pane_host.kill(pane_id);
                 }
                 self.kill_probe_panes();
+                // Headless dispatches DO get their rows closed (ADR-0013):
+                // nothing reconciles them yet, so a bare kill would leave
+                // zombie Running rows in the roster forever.
+                let running: Vec<SessionId> = self
+                    .dispatches
+                    .iter()
+                    .filter(|(_, d)| !d.done)
+                    .map(|(&id, _)| id)
+                    .collect();
+                for session_id in running {
+                    if let Some(disp) = self.dispatches.get_mut(&session_id) {
+                        disp.handle.kill.kill();
+                        disp.done = true;
+                    }
+                    self.update_session_row(session_id, |record| {
+                        record.status = SessionStatus::Failed;
+                    });
+                    self.finalize_dispatch_row(session_id, "stopped at quit", None);
+                }
                 true
+            }
+            ConfirmAction::PromoteRunningDispatch { session_id } => {
+                self.stop_running_dispatch(session_id);
+                if let Err(msg) = self.resume_into_tab(session_id) {
+                    // The row was Running a moment ago and its run is now
+                    // dead — downgrade it so the roster never shows a
+                    // zombie. Guarded: if the run finished while the
+                    // confirm was up, the tick already recorded the real
+                    // outcome and a failed resume must not clobber it.
+                    self.push_timeline(format!("✗ #{session_id} resume failed: {msg}"));
+                    self.update_session_row(session_id, |record| {
+                        if record.status == SessionStatus::Running {
+                            record.status = SessionStatus::Failed;
+                        }
+                    });
+                    let _ = self.refresh_roster();
+                }
+                false
             }
         }
     }
@@ -1050,6 +1670,9 @@ impl App {
             self.usage.insert(kind, capture);
             changed = true;
         }
+
+        // Headless dispatch events (ADR-0013).
+        changed |= self.drive_dispatches();
         changed
     }
 
@@ -1273,7 +1896,37 @@ impl App {
                     );
                 } else {
                     let detached = self.detached_set();
-                    home::render_home(frame, body_area, &self.home, &detached);
+                    let show_compare = self.broadcast.is_some();
+                    let show_timeline = !self.timeline.is_empty();
+                    if !show_compare && !show_timeline {
+                        home::render_home(frame, body_area, &self.home, &detached);
+                    } else {
+                        // Roster on top, then the broadcast compare surface
+                        // when a group is active, then recent dispatch
+                        // activity (ADR-0013 panels). The timeline shrinks
+                        // while the compare surface is up; the roster's Min
+                        // holds on short terminals.
+                        let mut constraints = vec![Constraint::Min(5)];
+                        if show_compare {
+                            constraints.push(Constraint::Length(12));
+                        }
+                        if show_timeline {
+                            let cap = if show_compare { 6 } else { 10 };
+                            constraints.push(Constraint::Length(
+                                (self.timeline.len() as u16 + 2).min(cap),
+                            ));
+                        }
+                        let split = Layout::vertical(constraints).split(body_area);
+                        home::render_home(frame, split[0], &self.home, &detached);
+                        let mut next = 1;
+                        if let Some(group) = &self.broadcast {
+                            dispatch::render_compare(frame, split[next], group);
+                            next += 1;
+                        }
+                        if show_timeline {
+                            dispatch::render_timeline(frame, split[next], &self.timeline);
+                        }
+                    }
                 }
             }
         }
@@ -1286,6 +1939,12 @@ impl App {
         }
         if let Some(pal) = &self.palette {
             self.draw_palette(frame, area, pal);
+        }
+        if let Some(form) = &self.dispatch_form {
+            dispatch::render_form(frame, area, form);
+        }
+        if let Some(form) = &self.broadcast_form {
+            dispatch::render_broadcast_form(frame, area, form);
         }
         if let Some(action) = self.pending_confirm {
             self.draw_confirm(frame, area, action);
@@ -1526,6 +2185,9 @@ impl App {
                 .confirm_prompt(session_id)
                 .map(|p| format!("{p} [y/n = skip]"))
                 .unwrap_or_else(|| "Inject startup command? [y/n = skip]".to_string()),
+            ConfirmAction::PromoteRunningDispatch { session_id } => format!(
+                "Stop the headless run and resume session #{session_id} interactively? [y/n]"
+            ),
         };
         let block = Block::default().borders(Borders::ALL).title("Confirm");
         frame.render_widget(
@@ -1732,6 +2394,632 @@ mod tests {
         assert_eq!(app.default_picker_selection(), 1);
     }
 
+    #[test]
+    fn drive_dispatches_folds_events_into_registry_and_timeline() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // A headless registry row, exactly as start_dispatch would create it.
+        let now = SystemTime::now();
+        let record = SessionRecord {
+            id: 0,
+            tool: "claude-code".to_string(),
+            native_id: None,
+            name: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: SessionMode::Headless,
+            status: SessionStatus::Running,
+            created_at: now,
+            updated_at: now,
+            cost_usd: None,
+            model: None,
+            effort: None,
+            role: Some("coder".to_string()),
+        };
+        let sid = app.registry.create(&record).expect("create headless row");
+        let row = app
+            .registry
+            .record_dispatch(sid, "claude-code", "review", std::path::Path::new("/tmp"))
+            .expect("dispatch row");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: false,
+                dispatch_row: Some(row),
+            },
+        );
+
+        tx.send(AgentEvent::Started {
+            native_id: Some("native-xyz".to_string()),
+        })
+        .unwrap();
+        tx.send(AgentEvent::AgentText("thinking about it".to_string()))
+            .unwrap();
+        tx.send(AgentEvent::ToolActivity("Read".to_string()))
+            .unwrap();
+        assert!(app.drive_dispatches(), "pending events must mark dirty");
+
+        tx.send(AgentEvent::Completed {
+            result: "done".to_string(),
+            cost_usd: Some(0.02),
+        })
+        .unwrap();
+        drop(tx);
+        assert!(app.drive_dispatches());
+
+        let rec = app
+            .registry
+            .all()
+            .expect("read registry")
+            .into_iter()
+            .find(|r| r.id == sid)
+            .expect("row survives");
+        assert_eq!(rec.native_id.as_deref(), Some("native-xyz"));
+        assert_eq!(rec.status, SessionStatus::Completed);
+        assert_eq!(rec.cost_usd, Some(0.02));
+        let history = app.registry.dispatch_history(5).expect("history");
+        assert!(history[0].finished);
+        assert_eq!(history[0].outcome.as_deref(), Some("completed"));
+        assert!(app.dispatches[&sid].done);
+        assert!(app.timeline.iter().any(|l| l.contains("completed")));
+        // A finished dispatch is inert: nothing new to fold.
+        assert!(!app.drive_dispatches());
+    }
+
+    #[test]
+    fn serial_dispatch_lane_blocks_a_second_run_of_that_tool_only() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        app.probe_cache.insert(
+            AdapterKind::Antigravity,
+            Ok(crate::adapters::antigravity::EXPECTED_CAPS),
+        );
+        app.probe_cache.insert(
+            AdapterKind::ClaudeCode,
+            Ok(crate::adapters::claude_code::EXPECTED_CAPS),
+        );
+
+        // No running dispatches → both lanes free.
+        assert!(!app.serial_lane_busy(AdapterKind::Antigravity));
+        assert!(!app.serial_lane_busy(AdapterKind::ClaudeCode));
+
+        // One live agy dispatch → the agy lane is busy; claude (which does
+        // not declare serial_dispatch) never is.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            42,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::Antigravity,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        assert!(app.serial_lane_busy(AdapterKind::Antigravity));
+        assert!(!app.serial_lane_busy(AdapterKind::ClaudeCode));
+
+        // A finished run frees the lane.
+        app.dispatches.get_mut(&42).unwrap().done = true;
+        assert!(!app.serial_lane_busy(AdapterKind::Antigravity));
+    }
+
+    #[test]
+    fn open_dispatch_form_requires_an_installed_tool() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // Empty probe cache → every target greyed → the form refuses to open.
+        app.open_dispatch_form();
+        assert!(app.dispatch_form.is_none());
+        assert!(app.timeline.iter().any(|l| l.contains("no installed tool")));
+
+        app.probe_cache.insert(
+            AdapterKind::ClaudeCode,
+            Ok(crate::adapters::claude_code::EXPECTED_CAPS),
+        );
+        app.open_dispatch_form();
+        assert!(app.dispatch_form.is_some());
+    }
+
+    // -- broadcast (ADR-0013 decision 5, second half) ------------------------
+
+    fn plan_with_broadcast(roles: &[(&str, &str)], broadcast: &[&str]) -> SwarmPlan {
+        let mut map = std::collections::BTreeMap::new();
+        for (name, tool) in roles {
+            map.insert(
+                name.to_string(),
+                Role {
+                    tool: tool.to_string(),
+                    model: None,
+                    effort: None,
+                    purpose: None,
+                    startup_commands: vec![],
+                },
+            );
+        }
+        SwarmPlan {
+            roles: map,
+            defaults: Defaults {
+                broadcast: Some(broadcast.iter().map(|s| s.to_string()).collect()),
+                ..Defaults::default()
+            },
+        }
+    }
+
+    fn seed_both_caps(app: &mut App) {
+        app.probe_cache.insert(
+            AdapterKind::ClaudeCode,
+            Ok(crate::adapters::claude_code::EXPECTED_CAPS),
+        );
+        app.probe_cache.insert(
+            AdapterKind::Antigravity,
+            Ok(crate::adapters::antigravity::EXPECTED_CAPS),
+        );
+    }
+
+    #[test]
+    fn b_key_opens_the_broadcast_form_from_home() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        app.plan = Some(plan_with_broadcast(
+            &[("coder", "claude-code"), ("researcher", "antigravity")],
+            &["coder"],
+        ));
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+        let form = app.broadcast_form.as_ref().expect("form opens on b");
+        // Targets: roles alphabetically, then the raw registry tools; only
+        // the named role starts ticked — the agy-backed role does not.
+        assert_eq!(form.ticked, vec![true, false, false, false]);
+        assert!(!form.cwd.is_empty());
+    }
+
+    #[test]
+    fn open_broadcast_form_requires_an_installed_tool() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // Empty probe cache → every target greyed → the form refuses to open.
+        app.open_broadcast_form();
+        assert!(app.broadcast_form.is_none());
+        assert!(app.timeline.iter().any(|l| l.contains("no installed tool")));
+
+        app.probe_cache.insert(
+            AdapterKind::ClaudeCode,
+            Ok(crate::adapters::claude_code::EXPECTED_CAPS),
+        );
+        app.open_broadcast_form();
+        assert!(app.broadcast_form.is_some());
+    }
+
+    #[test]
+    fn broadcast_submit_refuses_a_second_target_on_a_serial_lane() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        // Two agy-backed roles, both preticked via defaults.broadcast.
+        app.plan = Some(plan_with_broadcast(
+            &[("digger", "antigravity"), ("scout", "antigravity")],
+            &["digger", "scout"],
+        ));
+        app.open_broadcast_form();
+        app.broadcast_form.as_mut().expect("form open").prompt = "compare".to_string();
+
+        app.handle_broadcast_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let form = app.broadcast_form.as_ref().expect("form stays open");
+        let err = form.error.as_deref().expect("inline error");
+        assert!(err.contains("untick all but one"), "got: {err}");
+        assert!(app.dispatches.is_empty(), "nothing may have dispatched");
+        assert!(app.broadcast.is_none());
+    }
+
+    #[test]
+    fn broadcast_submit_refuses_a_serial_target_while_its_lane_is_busy() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        app.plan = Some(plan_with_broadcast(
+            &[("digger", "antigravity")],
+            &["digger"],
+        ));
+        // A live agy run from an earlier single dispatch holds the lane.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            42,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::Antigravity,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        app.open_broadcast_form();
+        app.broadcast_form.as_mut().expect("form open").prompt = "compare".to_string();
+
+        app.handle_broadcast_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let form = app.broadcast_form.as_ref().expect("form stays open");
+        let err = form.error.as_deref().expect("inline error");
+        assert!(err.contains("one headless run at a time"), "got: {err}");
+        assert_eq!(app.dispatches.len(), 1, "only the pre-existing run");
+        assert!(app.broadcast.is_none());
+    }
+
+    #[test]
+    fn broadcast_events_fold_into_compare_columns_and_registry_once() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // Two headless rows exactly as start_dispatch would create them.
+        let mut make = |role: &str| {
+            let now = SystemTime::now();
+            let record = SessionRecord {
+                id: 0,
+                tool: "claude-code".to_string(),
+                native_id: None,
+                name: None,
+                cwd: std::path::PathBuf::from("/tmp"),
+                mode: SessionMode::Headless,
+                status: SessionStatus::Running,
+                created_at: now,
+                updated_at: now,
+                cost_usd: None,
+                model: None,
+                effort: None,
+                role: Some(role.to_string()),
+            };
+            let sid = app.registry.create(&record).expect("create row");
+            let row = app
+                .registry
+                .record_dispatch(
+                    sid,
+                    "claude-code",
+                    "same prompt",
+                    std::path::Path::new("/tmp"),
+                )
+                .expect("dispatch row");
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.dispatches.insert(
+                sid,
+                dispatch::RunningDispatch {
+                    handle: adapters::test_dispatch_handle(rx),
+                    kind: AdapterKind::ClaudeCode,
+                    done: false,
+                    dispatch_row: Some(row),
+                },
+            );
+            (sid, tx)
+        };
+        let (sid_a, tx_a) = make("coder");
+        let (sid_b, tx_b) = make("advisor");
+        app.broadcast = Some(dispatch::BroadcastGroup {
+            columns: vec![
+                dispatch::BroadcastColumn::new(sid_a, "coder".to_string()),
+                dispatch::BroadcastColumn::new(sid_b, "advisor".to_string()),
+            ],
+        });
+
+        tx_a.send(AgentEvent::Started {
+            native_id: Some("native-a".to_string()),
+        })
+        .unwrap();
+        tx_a.send(AgentEvent::AgentText("answer a".to_string()))
+            .unwrap();
+        tx_a.send(AgentEvent::Completed {
+            result: "answer a".to_string(),
+            cost_usd: Some(0.04),
+        })
+        .unwrap();
+        tx_b.send(AgentEvent::Failed {
+            reason: "budget exceeded".to_string(),
+        })
+        .unwrap();
+        assert!(app.drive_dispatches());
+
+        // Columns carry the presentation state…
+        let group = app.broadcast.as_ref().expect("group survives");
+        assert_eq!(group.columns[0].status, SessionStatus::Completed);
+        assert_eq!(group.columns[0].cost_usd, Some(0.04));
+        assert!(group.columns[0].tail.iter().any(|l| l == "answer a"));
+        assert_eq!(group.columns[1].status, SessionStatus::Failed);
+
+        // …and the registry/timeline fold is exactly what single dispatches
+        // get (nothing double-applied, nothing skipped).
+        let records = app.registry.all().expect("read registry");
+        let rec_a = records.iter().find(|r| r.id == sid_a).expect("row a");
+        assert_eq!(rec_a.status, SessionStatus::Completed);
+        assert_eq!(rec_a.cost_usd, Some(0.04));
+        assert_eq!(rec_a.native_id.as_deref(), Some("native-a"));
+        let rec_b = records.iter().find(|r| r.id == sid_b).expect("row b");
+        assert_eq!(rec_b.status, SessionStatus::Failed);
+        let history = app.registry.dispatch_history(5).expect("history");
+        assert!(history.iter().all(|d| d.finished));
+        assert!(app.timeline.iter().any(|l| l.contains("completed")));
+    }
+
+    #[test]
+    fn esc_dismisses_the_compare_surface_without_killing_dispatches() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            42,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        app.broadcast = Some(dispatch::BroadcastGroup {
+            columns: vec![dispatch::BroadcastColumn::new(42, "coder".to_string())],
+        });
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.broadcast.is_none(), "presentation dismissed");
+        assert!(!app.dispatches[&42].done, "the run itself keeps going");
+    }
+
+    // -- promote hardening (ADR-0013 decision 6) -----------------------------
+
+    /// A registered roster row without touching the registry — promote reads
+    /// records through the roster, so tests can stage exactly the state they
+    /// mean.
+    fn push_roster_row(
+        app: &mut App,
+        id: u64,
+        tool: &str,
+        mode: SessionMode,
+        status: SessionStatus,
+        native_id: Option<&str>,
+    ) {
+        let mut record = test_record(id, tool);
+        record.mode = mode;
+        record.status = status;
+        record.native_id = native_id.map(String::from);
+        app.home.roster.push(RosterEntry::Registered(record));
+    }
+
+    fn select_row(app: &mut App, id: u64) {
+        app.home.selected = app
+            .home
+            .roster
+            .iter()
+            .position(|e| matches!(e, RosterEntry::Registered(r) if r.id == id))
+            .expect("row present");
+    }
+
+    #[test]
+    fn enter_on_a_running_dispatch_row_raises_the_promote_confirm() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        push_roster_row(
+            &mut app,
+            7,
+            "claude-code",
+            SessionMode::Headless,
+            SessionStatus::Running,
+            Some("native-7"),
+        );
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            7,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        select_row(&mut app, 7);
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.pending_confirm,
+            Some(ConfirmAction::PromoteRunningDispatch { session_id: 7 })
+        );
+    }
+
+    #[test]
+    fn enter_on_an_open_tab_row_focuses_it_instead_of_duplicating() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // Session 1 (live pane, from the helper) already has an open tab;
+        // focus is back on Home.
+        app.tabs.promote(1);
+        app.tabs.active = 0;
+        select_row(&mut app, 1);
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.tabs.items.len(), 2, "no duplicate tab");
+        assert_eq!(app.tabs.active, 1, "existing tab focused");
+    }
+
+    #[test]
+    fn enter_on_a_stale_running_row_reports_not_promotable_on_the_timeline() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        // Running per the registry, but no pane and no live dispatch — e.g.
+        // the app died mid-run.
+        push_roster_row(
+            &mut app,
+            9,
+            "claude-code",
+            SessionMode::Headless,
+            SessionStatus::Running,
+            Some("native-9"),
+        );
+        select_row(&mut app, 9);
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.pending_confirm.is_none());
+        assert!(
+            app.timeline.iter().any(|l| l.contains("stale")),
+            "timeline: {:?}",
+            app.timeline
+        );
+    }
+
+    #[test]
+    fn stopping_a_running_dispatch_finalizes_its_row_and_frees_the_serial_lane() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        // The dispatches table enforces its sessions foreign key — stage a
+        // real headless row exactly as start_dispatch would.
+        let mut record = test_record(0, "antigravity");
+        record.mode = SessionMode::Headless;
+        let sid = app.registry.create(&record).expect("create row");
+        let row = app
+            .registry
+            .record_dispatch(sid, "antigravity", "dig", std::path::Path::new("/tmp"))
+            .expect("dispatch row");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::Antigravity,
+                done: false,
+                dispatch_row: Some(row),
+            },
+        );
+        assert!(app.serial_lane_busy(AdapterKind::Antigravity));
+
+        app.stop_running_dispatch(sid);
+
+        assert!(!app.serial_lane_busy(AdapterKind::Antigravity));
+        assert!(!app.dispatches.contains_key(&sid));
+        let history = app.registry.dispatch_history(5).expect("history");
+        assert!(history[0].finished);
+        assert_eq!(history[0].outcome.as_deref(), Some("stopped for promote"));
+        assert!(app
+            .timeline
+            .iter()
+            .any(|l| l.contains("stopped for promote")));
+    }
+
+    #[test]
+    fn promote_confirm_on_an_already_finished_dispatch_does_not_refinalize() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        let mut record = test_record(0, "claude-code");
+        record.mode = SessionMode::Headless;
+        let sid = app.registry.create(&record).expect("create row");
+        let row = app
+            .registry
+            .record_dispatch(sid, "claude-code", "review", std::path::Path::new("/tmp"))
+            .expect("dispatch row");
+        app.registry
+            .finalize_dispatch(row, "completed", Some(0.1))
+            .expect("finalize");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: true,
+                dispatch_row: Some(row),
+            },
+        );
+
+        app.stop_running_dispatch(sid);
+
+        let history = app.registry.dispatch_history(5).expect("history");
+        assert_eq!(
+            history[0].outcome.as_deref(),
+            Some("completed"),
+            "a real outcome is never overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_promote_stops_the_dispatch_before_attempting_the_bridge() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // A registry-backed row whose tool slug no adapter resolves: the
+        // bridge must degrade to a timeline error without spawning, and the
+        // stop must already have happened.
+        let mut record = test_record(0, "mystery-tool");
+        record.mode = SessionMode::Headless;
+        record.native_id = Some("native-m".to_string());
+        let sid = app.registry.create(&record).expect("create row");
+        record.id = sid;
+        app.home.roster.push(RosterEntry::Registered(record));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        app.pending_confirm = Some(ConfirmAction::PromoteRunningDispatch { session_id: sid });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+
+        assert!(app.pending_confirm.is_none());
+        assert!(!app.dispatches.contains_key(&sid), "dispatch was stopped");
+        assert!(
+            app.timeline.iter().any(|l| l.contains("resume failed")),
+            "timeline: {:?}",
+            app.timeline
+        );
+        let rec = app
+            .registry
+            .all()
+            .expect("read registry")
+            .into_iter()
+            .find(|r| r.id == sid)
+            .expect("row survives");
+        assert_eq!(
+            rec.status,
+            SessionStatus::Failed,
+            "the dead run's row is downgraded, never left Running"
+        );
+        assert_eq!(app.pane_of_session.len(), 1, "no new pane spawned");
+    }
+
+    #[tokio::test]
+    async fn promote_confirm_after_the_run_finished_keeps_the_completed_row() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // The run finished (row Completed, dispatch done) while the confirm
+        // modal was up; the resume then fails (unknown tool). The real
+        // outcome must survive the failed bridge.
+        let mut record = test_record(0, "mystery-tool");
+        record.mode = SessionMode::Headless;
+        record.status = SessionStatus::Completed;
+        record.native_id = Some("native-m".to_string());
+        let sid = app.registry.create(&record).expect("create row");
+        record.id = sid;
+        app.home.roster.push(RosterEntry::Registered(record));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: true,
+                dispatch_row: None,
+            },
+        );
+        app.pending_confirm = Some(ConfirmAction::PromoteRunningDispatch { session_id: sid });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+
+        let rec = app
+            .registry
+            .all()
+            .expect("read registry")
+            .into_iter()
+            .find(|r| r.id == sid)
+            .expect("row survives");
+        assert_eq!(
+            rec.status,
+            SessionStatus::Completed,
+            "a finished run's real outcome is never clobbered by a failed resume"
+        );
+        assert!(app.timeline.iter().any(|l| l.contains("resume failed")));
+    }
+
     // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
 
     fn test_record(id: u64, tool: &str) -> SessionRecord {
@@ -1794,6 +3082,11 @@ mod tests {
             usage: HashMap::new(),
             probes: HashMap::new(),
             pane_area_size: PaneSize { rows: 24, cols: 80 },
+            dispatches: HashMap::new(),
+            dispatch_form: None,
+            timeline: std::collections::VecDeque::new(),
+            broadcast_form: None,
+            broadcast: None,
         };
         (app, tmp)
     }
