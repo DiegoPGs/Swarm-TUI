@@ -19,9 +19,9 @@ workspace:
 
 ## Status
 
-**Milestone 2d (workspace personalization) is implemented as of 2026-07-17**,
-on top of the 2c swarm plan (2026-07-16), the 2b command plane (same day), and
-the 2a shell (2026-07-15). `cargo run` boots a real, interactive terminal
+**Milestone 3 (the programmatic plane) is implemented as of 2026-07-17**, on
+top of 2d workspace personalization (same day), the 2c swarm plan
+(2026-07-16), the 2b command plane (same day), and the 2a shell (2026-07-15). `cargo run` boots a real, interactive terminal
 shell — tabs, a home roster, and live PTY sessions for Claude Code and
 Antigravity CLI (an active tool degrades to a greyed-out badge if its probe
 fails, never disappears), plus Claude Code background-agent reconciliation, a
@@ -42,9 +42,19 @@ facts live in
 [`docs/integrations/command-surfaces.md`](docs/integrations/command-surfaces.md). **Codex CLI is suspended as of 2026-07-16**
 ([ADR-0008](docs/adr/0008-suspend-codex-integration.md)): its adapter stays
 compiled for easy reversal, but it is never probed, offered, or spawned; historical
-codex rows still render read-only in the roster. Headless dispatch
-(`dispatch()`/`follow_up()`), broadcast, pipelines, and MCP integration are not
-implemented yet — deferred to a later milestone. Read
+codex rows still render read-only in the roster. New in milestone 3
+([ADR-0013](docs/adr/0013-programmatic-plane-dispatch-broadcast.md)): **headless
+dispatch** from the Home view (`i` — prompt, target role/tool, cwd, and
+neutral guardrails prefilled from `defaults.dispatch`; claude streams
+stream-json events, agy synthesizes them from plain text on a serialized
+lane), **broadcast** (`b` — same prompt to N ticked targets, preselected from
+`defaults.broadcast`, with a side-by-side compare surface: status, cost,
+rolling tail per target), a Home **timeline** of dispatch activity, and the
+**one-live-handle rule** — Enter on a session whose native id is already
+attached focuses the existing tab, a finished headless claude row resumes
+into a fresh interactive pane (the registry→tab bridge), and promoting a
+still-running dispatch asks before stop-and-resume. Pipelines and MCP
+integration are not implemented — deferred. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design,
 [`docs/adr/`](docs/adr/) for the decisions and their rejected alternatives,
 and [`docs/NOTES.md`](docs/NOTES.md) for what's verified against official docs
@@ -98,10 +108,11 @@ paints, and any command whose effect persists beyond the session asks for a y/n
 first. `defaults` are preferences, not policy: `default_role` preselects a
 picker row; `broadcast` names the roles a broadcast targets by default (naming
 a role is the explicit opt-in for its tool — the quota-shared agy is out unless
-named); `dispatch` tightens the headless-dispatch guardrails in neutral terms
-(`posture`, `max_turns`, `max_budget_usd`, `timeout_secs` — broadcast and
-dispatch behavior land in milestone 3); `worktrees` accepts `in_place` for now
-(`per_task` is reserved).
+named, and unnamed targets start unticked in the broadcast form); `dispatch`
+tightens the headless-dispatch guardrails in neutral terms (`posture`,
+`max_turns`, `max_budget_usd`, `timeout_secs`), prefilling the dispatch and
+broadcast forms; `worktrees` accepts `in_place` for now (`per_task` is
+reserved).
 
 A personal, gitignored **`.swarm/swarm.local.json`** overlays the committed
 file: same schema, merged per named entry (role names, defaults fields) with
@@ -135,6 +146,12 @@ Pressing Ctrl-Space twice sends one literal Ctrl-Space byte through to the pane
 instead of dispatching a command — the escape hatch for a wrapped tool that itself
 binds Ctrl-Space. Full rationale in
 [`docs/adr/0007-input-routing-and-prefix-key.md`](docs/adr/0007-input-routing-and-prefix-key.md).
+
+On the **Home tab**, bare keys (no prefix) drive the surface itself
+(ADR-0013): `j`/`k` move the roster cursor, `Enter` promotes the selected
+session (focus its tab if attached, resume a finished headless row into a
+fresh pane, confirm-then-stop a running dispatch), `i` opens the dispatch
+form, `b` the broadcast form, and `Esc` dismisses the compare panel.
 
 ## The shape of it
 

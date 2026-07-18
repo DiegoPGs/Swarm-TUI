@@ -51,10 +51,11 @@ impl Tabs {
         }
     }
 
-    /// Open (or refocus) a session tab and switch to it — the registry→tab
-    /// bridge (ADR-0001): promoting a headless/detached session back into
-    /// view. Reuses an already-open tab for the same session instead of
-    /// opening a duplicate.
+    /// Open (or refocus) a session tab and switch to it. This is the
+    /// tab-focus half of promotion; the registry→tab bridge that actually
+    /// respawns a finished headless session lives in `App::resume_into_tab`
+    /// (ADR-0013). Reuses an already-open tab for the same session instead
+    /// of opening a duplicate.
     pub fn promote(&mut self, session_id: SessionId) {
         if let Some(pos) = self
             .items

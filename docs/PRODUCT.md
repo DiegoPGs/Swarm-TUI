@@ -46,6 +46,8 @@ driving any CLI's internal subagent system (ADR-0004); transcript browsing/repla
 3. **Which cross-agent workflow actually earns its keep first?** Broadcast-and-compare
    (e.g., same review prompt to all three) vs. plan→implement pipelines vs. pure
    roster/dispatch. v1 assumes roster+dispatch+broadcast; reorder if wrong.
+   *Roster + dispatch + broadcast-and-compare all shipped 2026-07-17 (milestone 3,
+   ADR-0013); which one earns its keep is now a usage question, not a build one.*
 4. **Worktree isolation.** Should home-view dispatch default to a fresh git worktree
    per task (Claude has `-w` native; Codex/agy would need swarm-tui to create it), or
    run in-place? In-place assumed for v1; worktrees are the obvious v2 safety upgrade.
@@ -56,8 +58,10 @@ driving any CLI's internal subagent system (ADR-0004); transcript browsing/repla
    broadcast exclude agy by default and require opting it in per task?
    *Decided 2026-07-17 (ADR-0012): yes — nothing is broadcast-targeted unless
    named; an agy-backed role joins only when the workspace names it in
-   `defaults.broadcast` or the user opts it in per task. Enforcement lands
-   with broadcast (milestone 3).*
+   `defaults.broadcast` or the user opts it in per task. Enforced since
+   2026-07-17 (milestone 3, ADR-0013): the broadcast form preticks only named
+   roles, ticking is the per-task opt-in, and the serialized agy lane refuses
+   double-booking at submit.*
 6. **Windows.** Design keeps the door open (ConPTY via portable-pty); is it worth any
    testing time at all, or is Linux+macOS the whole world for this tool?
 7. **Approval surfacing (v2).** Claude's `--permission-prompt-tool` could route

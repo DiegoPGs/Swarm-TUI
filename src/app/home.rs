@@ -10,9 +10,9 @@
 //! 3. **Broadcast compare** — same prompt to N tools, normalized `AgentEvent`
 //!    streams rendered side by side; agy joins only when opted in (quota).
 //!
-//! This milestone (Stage C) only builds panel 1 (roster) plus the row
-//! navigation/re-attach action; dispatch and broadcast compare land in a
-//! later milestone.
+//! All three panels are real since milestone 3 (ADR-0013): this module owns
+//! the roster; the dispatch/broadcast forms, timeline, and compare surface
+//! live in `dispatch.rs`, and the promote decision in `promote.rs`.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
