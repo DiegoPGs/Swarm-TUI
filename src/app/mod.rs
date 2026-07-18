@@ -16,6 +16,7 @@ pub mod dispatch;
 pub mod home;
 pub mod keys;
 pub mod palette;
+pub mod promote;
 pub mod reconcile;
 pub mod session_view;
 pub mod startup;
@@ -154,6 +155,12 @@ pub enum ConfirmAction {
     /// the queue continues. NEW in 2c: ADR-0009 shipped badge-only, the
     /// attended palette still injects without this confirm.
     StartupInjection {
+        session_id: SessionId,
+    },
+    /// Enter on a roster row whose headless dispatch is still running
+    /// (ADR-0013 decision 6): `y` stops the run, finalizes its rows, then
+    /// resumes the native session interactively in a fresh pane.
+    PromoteRunningDispatch {
         session_id: SessionId,
     },
 }
@@ -780,13 +787,7 @@ impl App {
             KeyCode::Char('i') => self.open_dispatch_form(),
             KeyCode::Char('b') => self.open_broadcast_form(),
             KeyCode::Esc if self.broadcast.is_some() => self.broadcast = None,
-            KeyCode::Enter => {
-                if let Some(session_id) = self.home.selected_session_id() {
-                    if home::is_detached(session_id, &self.pane_of_session, &self.tabs) {
-                        self.tabs.promote(session_id);
-                    }
-                }
-            }
+            KeyCode::Enter => self.promote_selected(),
             _ => {}
         }
     }
@@ -961,6 +962,142 @@ impl App {
         if !columns.is_empty() {
             self.broadcast = Some(dispatch::BroadcastGroup { prompt, columns });
         }
+    }
+
+    // -- promote hardening (ADR-0013 decision 6) -----------------------------
+
+    /// Home Enter: one live handle per native session. The decision itself
+    /// is pure (`promote::decide`); this arm assembles the live snapshot and
+    /// executes the verdict.
+    fn promote_selected(&mut self) {
+        let Some(session_id) = self.home.selected_session_id() else {
+            return; // reconciled-only rows have no registry row to attach
+        };
+        let Some(record) = self.record_for(session_id).cloned() else {
+            return;
+        };
+        let snap = self.attachment_snapshot(session_id, &record);
+        match promote::decide(&record, &snap) {
+            promote::PromoteAction::FocusExisting { session_id } => {
+                self.tabs.promote(session_id);
+            }
+            promote::PromoteAction::ConfirmStopDispatch { session_id } => {
+                self.pending_confirm = Some(ConfirmAction::PromoteRunningDispatch { session_id });
+            }
+            promote::PromoteAction::ResumeHeadless { session_id } => {
+                // The row is already finished — a failed spawn leaves its
+                // real outcome alone and just reports.
+                if let Err(msg) = self.resume_into_tab(session_id) {
+                    self.push_timeline(format!("✗ #{session_id} resume failed: {msg}"));
+                }
+            }
+            promote::PromoteAction::NotPromotable { reason } => {
+                self.push_timeline(format!("✗ #{session_id} promote: {reason}"));
+            }
+        }
+    }
+
+    /// Live-attachment snapshot for `promote::decide`: a native_id may be
+    /// held by an open pane or a live dispatch on any session row; the join
+    /// goes through the roster records. Resume capability comes from the
+    /// probed caps — `app` never names a tool (ADR-0006).
+    fn attachment_snapshot(
+        &self,
+        session_id: SessionId,
+        record: &SessionRecord,
+    ) -> promote::AttachmentSnapshot {
+        let selected_has_pane = self.pane_of_session.contains_key(&session_id);
+        let selected_has_running_dispatch =
+            self.dispatches.get(&session_id).is_some_and(|d| !d.done);
+        let native_attached_elsewhere = record.native_id.as_deref().and_then(|native| {
+            self.home.roster.iter().find_map(|entry| {
+                let RosterEntry::Registered(other) = entry else {
+                    return None;
+                };
+                if other.id == session_id || other.native_id.as_deref() != Some(native) {
+                    return None;
+                }
+                if self.pane_of_session.contains_key(&other.id) {
+                    Some((other.id, promote::Attachment::Pane))
+                } else if self.dispatches.get(&other.id).is_some_and(|d| !d.done) {
+                    Some((other.id, promote::Attachment::Dispatch))
+                } else {
+                    None
+                }
+            })
+        });
+        let resume_by_id = AdapterKind::from_slug(&record.tool).is_some_and(|kind| {
+            matches!(
+                self.probe_cache.get(&kind),
+                Some(Ok(caps)) if caps.resume == adapters::ResumeSupport::ById
+            )
+        });
+        promote::AttachmentSnapshot {
+            selected_has_pane,
+            selected_has_running_dispatch,
+            native_attached_elsewhere,
+            resume_by_id,
+        }
+    }
+
+    /// The registry→tab bridge (ADR-0013 decision 6): resume a finished
+    /// headless row's native session interactively in a fresh pane, reusing
+    /// the same registry row — one row per native id keeps the one-handle
+    /// guard's lookup unambiguous; the headless provenance stays in the
+    /// `dispatches` table. Runs in the RECORD's cwd: resume-by-id lookup is
+    /// scoped to it (AGENTS.md gotcha).
+    fn resume_into_tab(&mut self, session_id: SessionId) -> Result<(), String> {
+        let Some(record) = self.record_for(session_id).cloned() else {
+            return Err("row vanished from the roster".to_string());
+        };
+        let Some(kind) = AdapterKind::from_slug(&record.tool) else {
+            return Err(format!("unknown tool {}", record.tool));
+        };
+        let Some(native_id) = record.native_id.clone() else {
+            return Err("no native session id".to_string());
+        };
+        let intent = adapters::LaunchIntent::Resume { native_id };
+        let opts = adapters::LaunchOptions {
+            model: record.model.clone(),
+            effort: record.effort.clone(),
+        };
+        let cmd = kind.interactive_cmd(&intent, &opts, &record.cwd);
+        let pane_id = self
+            .pane_host
+            .spawn(cmd, self.pane_area_size)
+            .map_err(|e| format!("spawn failed: {e:?}"))?;
+        self.pane_of_session.insert(session_id, pane_id);
+        self.tabs.promote(session_id);
+        self.update_session_row(session_id, |record| {
+            record.status = SessionStatus::Running;
+            record.mode = SessionMode::Interactive;
+        });
+        let _ = self.refresh_roster();
+        Ok(())
+    }
+
+    /// Stop a running dispatch ahead of an interactive resume (ADR-0013):
+    /// the handle leaves the map FIRST so the tick never polls it again —
+    /// the reader thread's post-kill sends drop silently (its receiver is
+    /// gone) and it still reaps the child. A run that finished between
+    /// raising the confirm and answering it keeps its real outcome.
+    fn stop_running_dispatch(&mut self, session_id: SessionId) {
+        let Some(disp) = self.dispatches.remove(&session_id) else {
+            return;
+        };
+        if disp.done {
+            return;
+        }
+        disp.handle.kill.kill();
+        if let Some(row) = disp.dispatch_row {
+            if let Err(e) = self
+                .registry
+                .finalize_dispatch(row, "stopped for promote", None)
+            {
+                tracing::warn!(session_id, "dispatch finalize failed: {e:?}");
+            }
+        }
+        self.push_timeline(format!("■ #{session_id} stopped for promote"));
     }
 
     /// Whether `kind` declares `serial_dispatch` (ADR-0013) and already has
@@ -1469,6 +1606,20 @@ impl App {
                     self.finalize_dispatch_row(session_id, "stopped at quit", None);
                 }
                 true
+            }
+            ConfirmAction::PromoteRunningDispatch { session_id } => {
+                self.stop_running_dispatch(session_id);
+                if let Err(msg) = self.resume_into_tab(session_id) {
+                    // Unlike the finished-row path, this row was Running a
+                    // moment ago and its run is now dead — downgrade it so
+                    // the roster never shows a zombie Running row.
+                    self.push_timeline(format!("✗ #{session_id} resume failed: {msg}"));
+                    self.update_session_row(session_id, |record| {
+                        record.status = SessionStatus::Failed;
+                    });
+                    let _ = self.refresh_roster();
+                }
+                false
             }
         }
     }
@@ -2023,6 +2174,9 @@ impl App {
                 .confirm_prompt(session_id)
                 .map(|p| format!("{p} [y/n = skip]"))
                 .unwrap_or_else(|| "Inject startup command? [y/n = skip]".to_string()),
+            ConfirmAction::PromoteRunningDispatch { session_id } => format!(
+                "Stop the headless run and resume session #{session_id} interactively? [y/n]"
+            ),
         };
         let block = Block::default().borders(Borders::ALL).title("Confirm");
         frame.render_widget(
@@ -2589,6 +2743,229 @@ mod tests {
 
         assert!(app.broadcast.is_none(), "presentation dismissed");
         assert!(!app.dispatches[&42].done, "the run itself keeps going");
+    }
+
+    // -- promote hardening (ADR-0013 decision 6) -----------------------------
+
+    /// A registered roster row without touching the registry — promote reads
+    /// records through the roster, so tests can stage exactly the state they
+    /// mean.
+    fn push_roster_row(
+        app: &mut App,
+        id: u64,
+        tool: &str,
+        mode: SessionMode,
+        status: SessionStatus,
+        native_id: Option<&str>,
+    ) {
+        let mut record = test_record(id, tool);
+        record.mode = mode;
+        record.status = status;
+        record.native_id = native_id.map(String::from);
+        app.home.roster.push(RosterEntry::Registered(record));
+    }
+
+    fn select_row(app: &mut App, id: u64) {
+        app.home.selected = app
+            .home
+            .roster
+            .iter()
+            .position(|e| matches!(e, RosterEntry::Registered(r) if r.id == id))
+            .expect("row present");
+    }
+
+    #[test]
+    fn enter_on_a_running_dispatch_row_raises_the_promote_confirm() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        push_roster_row(
+            &mut app,
+            7,
+            "claude-code",
+            SessionMode::Headless,
+            SessionStatus::Running,
+            Some("native-7"),
+        );
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            7,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        select_row(&mut app, 7);
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.pending_confirm,
+            Some(ConfirmAction::PromoteRunningDispatch { session_id: 7 })
+        );
+    }
+
+    #[test]
+    fn enter_on_an_open_tab_row_focuses_it_instead_of_duplicating() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // Session 1 (live pane, from the helper) already has an open tab;
+        // focus is back on Home.
+        app.tabs.promote(1);
+        app.tabs.active = 0;
+        select_row(&mut app, 1);
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.tabs.items.len(), 2, "no duplicate tab");
+        assert_eq!(app.tabs.active, 1, "existing tab focused");
+    }
+
+    #[test]
+    fn enter_on_a_stale_running_row_reports_not_promotable_on_the_timeline() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        // Running per the registry, but no pane and no live dispatch — e.g.
+        // the app died mid-run.
+        push_roster_row(
+            &mut app,
+            9,
+            "claude-code",
+            SessionMode::Headless,
+            SessionStatus::Running,
+            Some("native-9"),
+        );
+        select_row(&mut app, 9);
+
+        app.handle_home_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.pending_confirm.is_none());
+        assert!(
+            app.timeline.iter().any(|l| l.contains("stale")),
+            "timeline: {:?}",
+            app.timeline
+        );
+    }
+
+    #[test]
+    fn stopping_a_running_dispatch_finalizes_its_row_and_frees_the_serial_lane() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        seed_both_caps(&mut app);
+        // The dispatches table enforces its sessions foreign key — stage a
+        // real headless row exactly as start_dispatch would.
+        let mut record = test_record(0, "antigravity");
+        record.mode = SessionMode::Headless;
+        let sid = app.registry.create(&record).expect("create row");
+        let row = app
+            .registry
+            .record_dispatch(sid, "antigravity", "dig", std::path::Path::new("/tmp"))
+            .expect("dispatch row");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::Antigravity,
+                done: false,
+                dispatch_row: Some(row),
+            },
+        );
+        assert!(app.serial_lane_busy(AdapterKind::Antigravity));
+
+        app.stop_running_dispatch(sid);
+
+        assert!(!app.serial_lane_busy(AdapterKind::Antigravity));
+        assert!(!app.dispatches.contains_key(&sid));
+        let history = app.registry.dispatch_history(5).expect("history");
+        assert!(history[0].finished);
+        assert_eq!(history[0].outcome.as_deref(), Some("stopped for promote"));
+        assert!(app
+            .timeline
+            .iter()
+            .any(|l| l.contains("stopped for promote")));
+    }
+
+    #[test]
+    fn promote_confirm_on_an_already_finished_dispatch_does_not_refinalize() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        let mut record = test_record(0, "claude-code");
+        record.mode = SessionMode::Headless;
+        let sid = app.registry.create(&record).expect("create row");
+        let row = app
+            .registry
+            .record_dispatch(sid, "claude-code", "review", std::path::Path::new("/tmp"))
+            .expect("dispatch row");
+        app.registry
+            .finalize_dispatch(row, "completed", Some(0.1))
+            .expect("finalize");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: true,
+                dispatch_row: Some(row),
+            },
+        );
+
+        app.stop_running_dispatch(sid);
+
+        let history = app.registry.dispatch_history(5).expect("history");
+        assert_eq!(
+            history[0].outcome.as_deref(),
+            Some("completed"),
+            "a real outcome is never overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_promote_stops_the_dispatch_before_attempting_the_bridge() {
+        let (mut app, _tmp) = app_with_cat_pane("claude-code");
+        // A registry-backed row whose tool slug no adapter resolves: the
+        // bridge must degrade to a timeline error without spawning, and the
+        // stop must already have happened.
+        let mut record = test_record(0, "mystery-tool");
+        record.mode = SessionMode::Headless;
+        record.native_id = Some("native-m".to_string());
+        let sid = app.registry.create(&record).expect("create row");
+        record.id = sid;
+        app.home.roster.push(RosterEntry::Registered(record));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.dispatches.insert(
+            sid,
+            dispatch::RunningDispatch {
+                handle: adapters::test_dispatch_handle(rx),
+                kind: AdapterKind::ClaudeCode,
+                done: false,
+                dispatch_row: None,
+            },
+        );
+        app.pending_confirm = Some(ConfirmAction::PromoteRunningDispatch { session_id: sid });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+
+        assert!(app.pending_confirm.is_none());
+        assert!(!app.dispatches.contains_key(&sid), "dispatch was stopped");
+        assert!(
+            app.timeline.iter().any(|l| l.contains("resume failed")),
+            "timeline: {:?}",
+            app.timeline
+        );
+        let rec = app
+            .registry
+            .all()
+            .expect("read registry")
+            .into_iter()
+            .find(|r| r.id == sid)
+            .expect("row survives");
+        assert_eq!(
+            rec.status,
+            SessionStatus::Failed,
+            "the dead run's row is downgraded, never left Running"
+        );
+        assert_eq!(app.pane_of_session.len(), 1, "no new pane spawned");
     }
 
     // -- palette wiring (fake `sh -c cat` panes only — no wrapped CLI) -------
