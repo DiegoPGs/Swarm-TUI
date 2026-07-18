@@ -948,7 +948,11 @@ impl App {
             .first()
             .map(|(_, task)| task.prompt.clone())
             .unwrap_or_default();
-        self.push_timeline(format!("⇉ broadcast: {} targets", picked.len()));
+        self.push_timeline(format!(
+            "⇉ broadcast: {} targets: {}",
+            picked.len(),
+            truncate_line(&prompt, 50)
+        ));
         let mut columns = Vec::new();
         for (target, task) in picked {
             let label = target
@@ -960,7 +964,7 @@ impl App {
             }
         }
         if !columns.is_empty() {
-            self.broadcast = Some(dispatch::BroadcastGroup { prompt, columns });
+            self.broadcast = Some(dispatch::BroadcastGroup { columns });
         }
     }
 
@@ -2676,7 +2680,6 @@ mod tests {
         let (sid_a, tx_a) = make("coder");
         let (sid_b, tx_b) = make("advisor");
         app.broadcast = Some(dispatch::BroadcastGroup {
-            prompt: "same prompt".to_string(),
             columns: vec![
                 dispatch::BroadcastColumn::new(sid_a, "coder".to_string()),
                 dispatch::BroadcastColumn::new(sid_b, "advisor".to_string()),
@@ -2735,7 +2738,6 @@ mod tests {
             },
         );
         app.broadcast = Some(dispatch::BroadcastGroup {
-            prompt: "p".to_string(),
             columns: vec![dispatch::BroadcastColumn::new(42, "coder".to_string())],
         });
 

@@ -1,7 +1,8 @@
-//! Headless dispatch UI state (ADR-0013): the Home-local dispatch form, the
-//! running-dispatch bookkeeping the app folds events into, and the timeline
-//! panel. Knows tools only as `AdapterKind` + data (ADR-0006): every flag
-//! decision lives behind `CliAdapter::dispatch`.
+//! Headless dispatch UI state (ADR-0013): the Home-local dispatch and
+//! broadcast forms, the running-dispatch bookkeeping the app folds events
+//! into, the timeline panel, and the broadcast compare surface. Knows tools
+//! only as `AdapterKind` + data (ADR-0006): every flag decision lives behind
+//! `CliAdapter::dispatch`.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -483,7 +484,6 @@ impl BroadcastColumn {
 /// fold; sessions not in this group are ignored.
 #[derive(Debug)]
 pub struct BroadcastGroup {
-    pub prompt: String,
     pub columns: Vec<BroadcastColumn>,
 }
 
@@ -961,7 +961,6 @@ mod tests {
     #[test]
     fn compare_group_folds_status_cost_and_tail_per_column() {
         let mut group = BroadcastGroup {
-            prompt: "same prompt".to_string(),
             columns: vec![
                 BroadcastColumn::new(1, "coder".to_string()),
                 BroadcastColumn::new(2, "researcher".to_string()),
