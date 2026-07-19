@@ -267,6 +267,11 @@ impl Registry {
     /// First writer of the pre-created `dispatches` table (ADR-0013): one
     /// row per headless dispatch, inserted at spawn; `finalize_dispatch`
     /// completes it on the terminal event. Returns the dispatch row id.
+    ///
+    /// **The prompt is redacted here, unconditionally** (spec W-29, F-011).
+    /// This is the persistence chokepoint by design: redacting at the call
+    /// site would let a future caller forget. The *raw* prompt still reaches
+    /// the CLI — adapters build argv from `Task.prompt`, never from this row.
     pub fn record_dispatch(
         &mut self,
         session_id: u64,
@@ -281,7 +286,7 @@ impl Registry {
                 params![
                     session_id as i64,
                     tool,
-                    prompt,
+                    crate::core::redact::redact(prompt),
                     cwd.to_string_lossy(),
                     system_time_to_unix(SystemTime::now()),
                 ],
@@ -690,6 +695,86 @@ INSERT INTO schema_version (version) VALUES (2);
         assert!(rows[0].finished);
         assert_eq!(rows[0].outcome.as_deref(), Some("completed"));
         assert_eq!(rows[0].cost_usd, Some(0.05));
+    }
+
+    /// F-011 / spec W-29: a credential pasted into a dispatch prompt must not
+    /// reach the registry verbatim. `record_dispatch` is the chokepoint — the
+    /// raw prompt still goes to the CLI (pinned by
+    /// `dispatch_argv_still_carries_the_raw_prompt` in the claude adapter);
+    /// only the persisted copy is redacted.
+    #[test]
+    fn dispatch_prompt_with_api_key_is_redacted_before_persistence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut registry = Registry::open(&tmp.path().join("registry.db")).expect("open");
+        let sid = registry.create(&sample_record(0)).expect("create session");
+        let secret = "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKK";
+        registry
+            .record_dispatch(
+                sid,
+                "claude-code",
+                &format!("deploy using {secret} then report back"),
+                Path::new("/tmp/repo"),
+            )
+            .expect("record dispatch");
+
+        let rows = registry.dispatch_history(10).expect("history");
+        let stored = &rows[0].prompt;
+        assert!(
+            !stored.contains(secret),
+            "secret persisted verbatim: {stored}"
+        );
+        assert!(
+            stored.contains("[redacted:"),
+            "no redaction marker in stored prompt: {stored}"
+        );
+        // Redaction is targeted, not a blanket wipe — the surrounding task
+        // text is what makes the row useful for a postmortem.
+        assert!(
+            stored.contains("deploy using"),
+            "lost leading text: {stored}"
+        );
+        assert!(
+            stored.contains("then report back"),
+            "lost trailing text: {stored}"
+        );
+
+        // The property that actually matters is bytes at rest, not what the
+        // read path hands back. Scan every file the registry produced — the
+        // .db plus its WAL/SHM sidecars, which hold recently-written rows until
+        // a checkpoint folds them in.
+        drop(registry);
+        let mut scanned_bytes = 0usize;
+        for entry in std::fs::read_dir(tmp.path()).expect("read tempdir") {
+            let path = entry.expect("dir entry").path();
+            let bytes = std::fs::read(&path).expect("read registry file");
+            scanned_bytes += bytes.len();
+            assert!(
+                !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                "secret found at rest in {}",
+                path.display()
+            );
+        }
+        // Guard against a vacuous pass if the layout ever changes and the scan
+        // above finds nothing to read.
+        assert!(scanned_bytes > 0, "scanned no registry bytes");
+    }
+
+    /// The failure mode on the other side of F-011: over-redaction mangling
+    /// ordinary prompts. A prompt with no credential shapes round-trips byte
+    /// for byte.
+    #[test]
+    fn ordinary_dispatch_prompts_are_persisted_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut registry = Registry::open(&tmp.path().join("registry.db")).expect("open");
+        let sid = registry.create(&sample_record(0)).expect("create session");
+        let prompt = "Refactor src/app/mod.rs: extract the 33ms tick into \
+                      drive_background() and add a test at tests/fixtures/x.json";
+        registry
+            .record_dispatch(sid, "claude-code", prompt, Path::new("/tmp/repo"))
+            .expect("record dispatch");
+
+        let rows = registry.dispatch_history(10).expect("history");
+        assert_eq!(rows[0].prompt, prompt);
     }
 
     #[test]

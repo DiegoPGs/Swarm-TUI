@@ -271,6 +271,13 @@ impl StartupQueue {
                 if since.elapsed() > ECHO_CAP {
                     // The pane is swallowing characters (modal?). Never send
                     // a blind Enter — skip everything (ADR-0010).
+                    //
+                    // This is the only site that logs user-authored text, and
+                    // the log file is append-only with no rotation — so it goes
+                    // through the same redaction as persisted prompts (W-29,
+                    // F-011). Defense in depth: a startup command is a slash
+                    // command, so a credential here is unlikely, not impossible.
+                    let text = crate::core::redact::redact(text);
                     tracing::warn!(
                         "startup[{}]: {text:?} never echoed — pane swallowing input? \
                          Skipping remaining commands",

@@ -7,6 +7,10 @@
 *.db
 *.db-journal
 *.sqlite
+# WAL sidecars carry recently-written row data (including dispatch prompts)
+# until a checkpoint folds them into the .db — F-011.
+*.db-wal
+*.db-shm
 
 # Environment / secrets — this project must never contain credentials
 .env
