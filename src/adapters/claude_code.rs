@@ -667,6 +667,24 @@ mod tests {
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp/repo")));
     }
 
+    /// F-011 guard, the other half of the redaction split: what swarm-tui
+    /// *persists* is redacted (`store::Registry::record_dispatch`), but what it
+    /// *sends* must stay byte-identical to what the user typed. A well-meaning
+    /// future change that redacts here instead of at the store boundary would
+    /// silently corrupt every dispatch carrying a credential-shaped string —
+    /// this test fails loudly if that happens.
+    #[test]
+    fn dispatch_argv_still_carries_the_raw_prompt() {
+        let raw = "rotate sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF and confirm";
+        let cmd = ClaudeCode.headless_cmd(&task(raw), HeadlessTarget::Fresh { session_id: "abc" });
+        let args = argv(&cmd);
+        assert_eq!(args[1], raw, "prompt was altered on its way to the CLI");
+        assert!(
+            !args.iter().any(|a| a.contains("[redacted:")),
+            "redaction leaked into argv: {args:?}"
+        );
+    }
+
     #[test]
     fn headless_edits_posture_maps_to_accept_edits_plus_file_allowlist() {
         let mut t = task("fix the bug");
